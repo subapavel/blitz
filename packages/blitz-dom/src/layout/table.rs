@@ -188,15 +188,22 @@ pub(crate) fn collect_table_cells(
 
             // TODO: account for padding/border/margin
             if *row == 1 {
-                let column = match style.size.width.tag() {
-                    taffy::CompactLength::LENGTH_TAG => {
-                        style_helpers::length(cell_border_box_width(&style))
+                // A `calc()` that survives Stylo's simplification mixes a percentage and a non-zero length;
+                // on a table cell it MUST be treated as `auto` (css-values-4 § Computed Value of math
+                // expressions). `tag()` of a calc value is not a valid tag, so test it first.
+                let column = if style.size.width.into_raw().is_calc() {
+                    style_helpers::auto()
+                } else {
+                    match style.size.width.tag() {
+                        taffy::CompactLength::LENGTH_TAG => {
+                            style_helpers::length(cell_border_box_width(&style))
+                        }
+                        taffy::CompactLength::PERCENT_TAG => {
+                            style_helpers::percent(style.size.width.value())
+                        }
+                        taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
+                        _ => unreachable!(),
                     }
-                    taffy::CompactLength::PERCENT_TAG => {
-                        style_helpers::percent(style.size.width.value())
-                    }
-                    taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
-                    _ => unreachable!(),
                 };
                 columns.push(column);
             } else if !is_fixed

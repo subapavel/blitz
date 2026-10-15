@@ -275,6 +275,13 @@ impl BaseDocument {
 
             // if damage.intersects(RestyleDamage::RELAYOUT | CONSTRUCT_BOX) {
             node.style = stylo_taffy::to_taffy_style(style);
+            // A table cell's `calc()` width that mixes a percentage and a length counts as `auto`
+            // (css-values-4, see `layout/table.rs`); otherwise it would still size the cell's content.
+            if style.clone_display().inside() == DisplayInside::TableCell
+                && node.style.size.width.into_raw().is_calc()
+            {
+                node.style.size.width = taffy::Dimension::auto();
+            }
             node.display_constructed_as = style.clone_display();
             // }
 
