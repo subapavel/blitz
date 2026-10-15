@@ -176,8 +176,13 @@ pub(crate) fn collect_table_cells(
                 let column = match style.size.width.tag() {
                     taffy::CompactLength::LENGTH_TAG => {
                         let len = style.size.width.value();
-                        let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
-                        style_helpers::length(len + padding.left + padding.right)
+                        // With `box-sizing: border-box` the width already includes padding and border.
+                        if style.box_sizing == taffy::BoxSizing::BorderBox {
+                            style_helpers::length(len)
+                        } else {
+                            let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
+                            style_helpers::length(len + padding.left + padding.right)
+                        }
                     }
                     taffy::CompactLength::PERCENT_TAG => {
                         style_helpers::percent(style.size.width.value())
