@@ -68,9 +68,13 @@ fn transform_text(text: &str, case: Option<TextTransformCase>) -> std::borrow::C
     })
 }
 
-/// Letters and digits continue a word; an apostrophe does too, but only inside one (`don't`, not `'quote`).
+/// Letters, digits, combining marks and soft hyphens continue a word; an apostrophe does too, but only inside
+/// one (`don't`, not `'quote`).
 fn next_at_word_start(at_word_start: bool, c: char) -> bool {
-    if c.is_alphanumeric() {
+    if c.is_alphanumeric()
+        || is_combining_mark(c)
+        || matches!(c, '\u{AD}' | '\u{200C}' | '\u{200D}')
+    {
         false
     } else if matches!(c, '\'' | '\u{2019}') {
         at_word_start
@@ -918,6 +922,8 @@ pub(crate) fn build_inline_layout_into(
                             builder.push_style_modification_span(&[]);
                             builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
                             builder.push_text("\n");
+                            // A forced line break ends the word for `text-transform: capitalize`.
+                            AT_WORD_START.with(|w| w.set(true));
                             builder.pop_style_span();
                             builder.set_white_space_mode(collapse_mode);
                         } else {
@@ -1008,4 +1014,14 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document => unreachable!(),
         }
     }
+}
+
+/// The combining diacritical mark blocks (enough for decomposed Latin, Greek and Cyrillic text).
+fn is_combining_mark(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}')
 }
