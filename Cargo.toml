@@ -37,10 +37,10 @@ blitz-html = { version = "0.2.0", path = "./packages/blitz-html", default-featur
 blitz-net = { version = "0.2.0", path = "./packages/blitz-net", default-features = false }
 blitz-paint = { version = "0.2.0", path = "./packages/blitz-paint", default-features = false }
 blitz-shell = { version = "0.2.0", path = "./packages/blitz-shell", default-features = false }
-blitz-traits = { version = "0.2.0", path = "./packages/blitz-traits", default-features = false }
-stylo_taffy = { version = "0.2.0", path = "./packages/stylo_taffy", default-features = false }
+blitz-traits = { version = "0.2.0", default-features = false }
+stylo_taffy = { version = "0.2.0", default-features = false }
 mini-dxn = { path = "./packages/mini-dxn", default-features = false }
-debug_timer = { version = "0.1.2", path = "./packages/debug_timer" }
+debug_timer = { version = "0.1.2" }
 
 # Servo dependencies
 style = { version = "0.8", package = "stylo" }
