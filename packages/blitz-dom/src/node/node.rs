@@ -592,7 +592,17 @@ impl Node {
             .map(|color| {
                 // usvg only understands sRGB colours; Stylo keeps `oklch()`, `lab()` …
                 // in their own space, so convert before serialising `currentColor`.
-                color.into_srgb_legacy().to_css_string()
+                // `none` components behave as 0 (css-color-4 §4.4); Stylo's conversion
+                // would carry them as NaN instead.
+                style::color::AbsoluteColor::new(
+                    color.color_space,
+                    color.c0().unwrap_or(0.0),
+                    color.c1().unwrap_or(0.0),
+                    color.c2().unwrap_or(0.0),
+                    color.alpha,
+                )
+                .into_srgb_legacy()
+                .to_css_string()
             });
 
         match &self.data {
