@@ -28,6 +28,57 @@ use crate::{
 
 use super::{damage::ALL_DAMAGE, list::collect_list_item_children, table::build_table_context};
 
+use style::values::specified::text::TextTransformCase;
+
+thread_local! {
+    /// Whether the next letter pushed into the current inline layout starts a word (for
+    /// `text-transform: capitalize`). Reset at the start of every inline layout.
+    static AT_WORD_START: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Applies the case part of `text-transform` (CSS Text 3 §2.1) to a text node's content. Word boundaries
+/// for `capitalize` carry over from the previous text node of the same inline layout, so `wo<b>rd</b>`
+/// stays one word. Language-specific mappings (Turkish dotted i, Greek accents) are not applied.
+fn transform_text(text: &str, case: Option<TextTransformCase>) -> std::borrow::Cow<'_, str> {
+    AT_WORD_START.with(|at_word_start| {
+        let mut start = at_word_start.get();
+        let out = match case {
+            Some(TextTransformCase::Uppercase) => std::borrow::Cow::Owned(text.to_uppercase()),
+            Some(TextTransformCase::Lowercase) => std::borrow::Cow::Owned(text.to_lowercase()),
+            Some(TextTransformCase::Capitalize) => {
+                let mut out = String::with_capacity(text.len());
+                for c in text.chars() {
+                    if start && c.is_alphabetic() {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.push(c);
+                    }
+                    start = next_at_word_start(start, c);
+                }
+                at_word_start.set(start);
+                return std::borrow::Cow::Owned(out);
+            }
+            _ => std::borrow::Cow::Borrowed(text),
+        };
+        for c in text.chars() {
+            start = next_at_word_start(start, c);
+        }
+        at_word_start.set(start);
+        out
+    })
+}
+
+/// Letters and digits continue a word; an apostrophe does too, but only inside one (`don't`, not `'quote`).
+fn next_at_word_start(at_word_start: bool, c: char) -> bool {
+    if c.is_alphanumeric() {
+        false
+    } else if matches!(c, '\'' | '\u{2019}') {
+        at_word_start
+    } else {
+        true
+    }
+}
+
 const DUMMY_NAME: QualName = qual_name!("div", html);
 
 #[derive(Clone)]
@@ -737,6 +788,8 @@ pub(crate) fn build_inline_layout_into(
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
+    // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
+    AT_WORD_START.with(|w| w.set(true));
 
     // Set whitespace collapsing mode
     let collapse_mode = root_node_style
@@ -941,7 +994,13 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Text(data) => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 // dbg!(&data.content);
-                builder.push_text(&data.content);
+                // Text nodes have no style of their own: `text-transform` comes from the parent element.
+                let case = node
+                    .parent
+                    .and_then(|parent| nodes[parent].primary_styles())
+                    .map(|style| style.clone_text_transform().case());
+                let text = transform_text(&data.content, case);
+                builder.push_text(&text);
             }
             NodeData::Comment => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
