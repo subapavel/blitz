@@ -95,6 +95,21 @@ pub(crate) fn build_table_context(
     (TableContext { style, items }, layout_children)
 }
 
+/// The border-box width of a cell with an explicit length `width`, which is what its column track needs.
+/// Under `content-box` the horizontal padding and border are added; under `border-box` the width already
+/// includes them, but never shrinks below them (css-sizing-3 §5.1).
+fn cell_border_box_width(style: &taffy::Style<Atom>) -> f32 {
+    let len = style.size.width.value();
+    let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
+    let border = style.border.resolve_or_zero(None, resolve_calc_value);
+    let padding_border = padding.left + padding.right + border.left + border.right;
+    if style.box_sizing == taffy::BoxSizing::BorderBox {
+        len.max(padding_border)
+    } else {
+        len + padding_border
+    }
+}
+
 pub(crate) fn collect_table_cells(
     doc: &mut BaseDocument,
     node_id: usize,
@@ -175,17 +190,7 @@ pub(crate) fn collect_table_cells(
             if *row == 1 {
                 let column = match style.size.width.tag() {
                     taffy::CompactLength::LENGTH_TAG => {
-                        let len = style.size.width.value();
-                        // With `box-sizing: border-box` the width already includes padding and border.
-                        if style.box_sizing == taffy::BoxSizing::BorderBox {
-                            style_helpers::length(len)
-                        } else {
-                            let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
-                            let border = style.border.resolve_or_zero(None, resolve_calc_value);
-                            style_helpers::length(
-                                len + padding.left + padding.right + border.left + border.right,
-                            )
-                        }
+                        style_helpers::length(cell_border_box_width(&style))
                     }
                     taffy::CompactLength::PERCENT_TAG => {
                         style_helpers::percent(style.size.width.value())
@@ -198,7 +203,7 @@ pub(crate) fn collect_table_cells(
                 && (*col as usize) < columns.len()
                 && taffy::CompactLength::LENGTH_TAG == style.size.width.tag()
             {
-                let new_len = style.size.width.value();
+                let new_len = cell_border_box_width(&style);
                 let tag = columns[*col as usize].tag();
                 let value = columns[*col as usize].value();
                 columns[*col as usize] = match tag {
