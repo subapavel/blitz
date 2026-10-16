@@ -2,6 +2,7 @@ use crate::NON_INCREMENTAL;
 use crate::node::NodeFlags;
 use crate::{BaseDocument, net::ImageHandler, node::BackgroundImageData, util::ImageType};
 use blitz_traits::net::Request;
+use markup5ever::local_name;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::selector_parser::RestyleDamage;
@@ -261,6 +262,23 @@ impl BaseDocument {
     pub fn flush_styles_to_layout(&mut self, node_id: usize) {
         let doc_id = self.id();
 
+        // Whether the grid container this node is an item of leaves `justify-items` / `align-items` at
+        // `normal` (stylo_taffy turns both `normal` and `stretch` into `Stretch`, so the computed style
+        // is read here).
+        let grid_parent_normal = self.nodes[node_id]
+            .layout_parent
+            .get()
+            .map(|parent| &self.nodes[parent])
+            .filter(|parent| parent.style.display == taffy::Display::Grid)
+            .and_then(|parent| {
+                let styles = parent.primary_styles()?;
+                let position = styles.get_position();
+                Some((
+                    position.justify_items.computed.0.value() == AlignFlags::NORMAL,
+                    position.align_items.0.value() == AlignFlags::NORMAL,
+                ))
+            });
+
         let display = {
             let node = self.nodes.get_mut(node_id).unwrap();
             let _damage = node.damage().unwrap_or(ALL_DAMAGE);
@@ -281,6 +299,45 @@ impl BaseDocument {
                 && node.style.size.width.into_raw().is_calc()
             {
                 node.style.size.width = taffy::Dimension::auto();
+            }
+            if let Some(element) = node.data.downcast_element() {
+                let tag = element.name.local.as_ref();
+                // HTML §15.4.3: the `width` / `height` attributes of an <img> are presentational hints,
+                // that is `width` / `height` declarations of the lowest priority. Taffy only looks at the
+                // style, and a definite size decides whether a flex item is stretched across the cross
+                // axis (css-flexbox §9.4) and whether a grid item has a size of its own.
+                if tag == "img" {
+                    let hint = |name| {
+                        element
+                            .attr(name)
+                            .and_then(|val| val.parse::<f32>().ok())
+                            .filter(|len| *len >= 0.0)
+                    };
+                    if node.style.size.width.is_auto() {
+                        if let Some(width) = hint(local_name!("width")) {
+                            node.style.size.width = taffy::Dimension::length(width);
+                        }
+                    }
+                    if node.style.size.height.is_auto() {
+                        if let Some(height) = hint(local_name!("height")) {
+                            node.style.size.height = taffy::Dimension::length(height);
+                        }
+                    }
+                }
+                // css-grid-1 §6.2 / css-align-3 §6.1: `normal` self-alignment of a grid item with a
+                // preferred aspect ratio, which every replaced element has, behaves as `start` rather
+                // than `stretch`. An explicit `stretch` (on the item or through `justify-items` /
+                // `align-items` on the container) is kept.
+                if let Some((justify_normal, align_normal)) = grid_parent_normal {
+                    if matches!(tag, "img" | "svg" | "canvas" | "video") {
+                        if justify_normal && node.style.justify_self.is_none() {
+                            node.style.justify_self = Some(taffy::AlignSelf::Start);
+                        }
+                        if align_normal && node.style.align_self.is_none() {
+                            node.style.align_self = Some(taffy::AlignSelf::Start);
+                        }
+                    }
+                }
             }
             node.display_constructed_as = style.clone_display();
             // }
