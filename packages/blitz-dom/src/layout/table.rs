@@ -163,15 +163,41 @@ pub(crate) fn grid_container_min_height(style: &mut taffy::Style<Atom>) {
     style.min_size.height = style_helpers::length(style.min_size.height.value() - frame);
 }
 
+/// The largest `colspan` HTML allows (HTML §4.9.11: a value above 1000 is clamped to 1000).
+const MAX_COLSPAN: u16 = 1000;
+
+/// Taffy grid lines are `i16`, and a placement past them panics. A row's cells are placed in at most this many
+/// columns; once a row reaches it, its remaining cells share the last column (laid out and painted, overlapping)
+/// instead of failing the whole document. Far beyond any real table (Chrome caps a span at 1000 as well).
+const MAX_COLUMNS: u16 = 16_384;
+
+/// A `colspan` attribute by HTML's rules for parsing non-negative integers (HTML §2.3.4.2): leading ASCII
+/// whitespace and one `+` skipped, then the leading digits (`"2.5"` and `"2px"` are 2). A missing, unparsable or
+/// zero value is 1; a value above [`MAX_COLSPAN`] is [`MAX_COLSPAN`] (HTML §4.9.11). Chrome agrees on every case.
+fn parse_colspan(value: Option<&str>) -> u16 {
+    let Some(value) = value else { return 1 };
+    let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let mut span: u32 = 0;
+    for digit in value.bytes().take_while(u8::is_ascii_digit) {
+        // Saturate early: only "above the maximum" matters, not the exact value.
+        span = (span * 10 + u32::from(digit - b'0')).min(u32::from(MAX_COLSPAN) + 1);
+    }
+    if span == 0 {
+        1
+    } else {
+        span.min(u32::from(MAX_COLSPAN)) as u16
+    }
+}
+
 /// Adds the table cell `node_id` (a `display: table-cell` element, or an anonymous cell) to the grid: its column
 /// track from the first row's widths (or a wider `width` below it), its grid position, and its style as a grid item.
 fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
     let node = &doc.nodes[node_id];
     let stylo_style = &node.primary_styles().unwrap();
-    let colspan: u16 = node
-        .attr(local_name!("colspan"))
-        .and_then(|val| val.parse().ok())
-        .unwrap_or(1);
+    // Past `MAX_COLUMNS` a cell goes into the last column (see there); its span never reaches past it.
+    grid.col = grid.col.min(MAX_COLUMNS - 1);
+    let colspan = parse_colspan(node.attr(local_name!("colspan"))).min(MAX_COLUMNS - grid.col);
     let mut style = stylo_taffy::to_taffy_style(stylo_style);
 
     // TODO: account for padding/border/margin
@@ -745,6 +771,31 @@ impl taffy::LayoutGridContainer for TableTreeWrapper<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colspan_is_parsed_like_html() {
+        for (value, span) in [
+            (None, 1),
+            (Some(""), 1),
+            (Some("0"), 1),
+            (Some("00"), 1),
+            (Some("-1"), 1),
+            (Some("abc"), 1),
+            (Some("+1"), 1),
+            (Some("2"), 2),
+            (Some(" 2"), 2),
+            (Some("\t\n2"), 2),
+            (Some("2.5"), 2),
+            (Some("2px"), 2),
+            (Some("02"), 2),
+            (Some("1000"), 1000),
+            (Some("1001"), 1000),
+            (Some("65536"), 1000),
+            (Some("99999999999999999999"), 1000),
+        ] {
+            assert_eq!(parse_colspan(value), span, "{value:?}");
+        }
+    }
     use taffy::style_helpers::{auto, percent};
 
     fn length(v: f32) -> taffy::Dimension {
