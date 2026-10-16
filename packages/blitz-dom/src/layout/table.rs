@@ -113,6 +113,32 @@ fn cell_border_box_width(style: &taffy::Style<Atom>) -> f32 {
     }
 }
 
+/// A table cell's or table's length `height` is a minimum (CSS 2.1 §17.5.3: a row is as tall as its cells'
+/// `height` and content need, a table's non-`auto` `height` is a minimum), and `max-height` is undefined on
+/// them (§10.7); content wins, so it is ignored. Express the `height` as `min-height` so that the box is never
+/// clamped below its content and the grid stretches the cell (`vertical-align` applies to it like to its
+/// siblings). Left alone when the `height` is not a plain length (percentage, `calc()`) or the box has another
+/// kind of `min-height`.
+pub(crate) fn height_as_table_minimum(style: &mut taffy::Style<Atom>) {
+    style.max_size.height = taffy::Dimension::auto();
+    if !style.size.height.into_raw().is_calc()
+        && style.size.height.tag() == taffy::CompactLength::LENGTH_TAG
+        && !style.min_size.height.into_raw().is_calc()
+    {
+        let height = style.size.height.value();
+        let min = style.min_size.height;
+        let merged = match min.tag() {
+            taffy::CompactLength::AUTO_TAG => Some(height),
+            taffy::CompactLength::LENGTH_TAG => Some(min.value().max(height)),
+            _ => None,
+        };
+        if let Some(merged) = merged {
+            style.min_size.height = style_helpers::length(merged);
+            style.size.height = style_helpers::auto();
+        }
+    }
+}
+
 pub(crate) fn collect_table_cells(
     doc: &mut BaseDocument,
     node_id: usize,
@@ -233,25 +259,7 @@ pub(crate) fn collect_table_cells(
                 end: style_helpers::span(1),
             };
             style.size.width = style_helpers::auto();
-            // A cell's `height` is a minimum for its row (CSS 2.1 §17.5.3). Express it as `min-height`
-            // and let the grid stretch the cell, so that `vertical-align` applies to it like to its
-            // siblings. Left alone when it is not a plain length or the cell has another kind of min.
-            if !style.size.height.into_raw().is_calc()
-                && style.size.height.tag() == taffy::CompactLength::LENGTH_TAG
-                && !style.min_size.height.into_raw().is_calc()
-            {
-                let height = style.size.height.value();
-                let min = style.min_size.height;
-                let merged = match min.tag() {
-                    taffy::CompactLength::AUTO_TAG => Some(height),
-                    taffy::CompactLength::LENGTH_TAG => Some(min.value().max(height)),
-                    _ => None,
-                };
-                if let Some(merged) = merged {
-                    style.min_size.height = style_helpers::length(merged);
-                    style.size.height = style_helpers::auto();
-                }
-            }
+            height_as_table_minimum(&mut style);
             cells.push(TableItem {
                 kind: TableItemKind::Cell,
                 node_id,
@@ -487,5 +495,69 @@ impl taffy::LayoutGridContainer for TableTreeWrapper<'_> {
 
     fn get_grid_child_style(&self, child_node_id: taffy::NodeId) -> Self::GridItemStyle<'_> {
         &self.ctx.items[usize::from(child_node_id)].style
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use taffy::style_helpers::{auto, percent};
+
+    fn length(v: f32) -> taffy::Dimension {
+        taffy::style_helpers::length(v)
+    }
+
+    fn styled(
+        height: taffy::Dimension,
+        min: taffy::Dimension,
+        max: taffy::Dimension,
+    ) -> taffy::Style<Atom> {
+        let mut style = taffy::Style::<Atom>::default();
+        style.size.height = height;
+        style.min_size.height = min;
+        style.max_size.height = max;
+        style
+    }
+
+    #[test]
+    fn a_length_height_becomes_the_minimum() {
+        let mut style = styled(length(40.0), auto(), auto());
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.size.height, auto());
+        assert_eq!(style.min_size.height, length(40.0));
+    }
+
+    #[test]
+    fn the_larger_of_height_and_min_height_wins() {
+        let mut style = styled(length(40.0), length(60.0), auto());
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.size.height, auto());
+        assert_eq!(style.min_size.height, length(60.0));
+        let mut style = styled(length(80.0), length(60.0), auto());
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.min_size.height, length(80.0));
+    }
+
+    #[test]
+    fn percentage_heights_and_percentage_minimums_are_left_alone() {
+        let mut style = styled(percent(0.5_f32), auto(), auto());
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.size.height, percent(0.5_f32));
+        assert_eq!(style.min_size.height, auto());
+        let mut style = styled(length(40.0), percent(0.5_f32), auto());
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.size.height, length(40.0));
+        assert_eq!(style.min_size.height, percent(0.5_f32));
+    }
+
+    #[test]
+    fn max_height_is_ignored() {
+        let mut style = styled(auto(), auto(), length(40.0));
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.max_size.height, auto());
+        let mut style = styled(length(20.0), length(10.0), length(15.0));
+        height_as_table_minimum(&mut style);
+        assert_eq!(style.max_size.height, auto());
+        assert_eq!(style.min_size.height, length(20.0));
     }
 }
