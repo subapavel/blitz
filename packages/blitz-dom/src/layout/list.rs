@@ -70,17 +70,27 @@ fn node_list_item_child(
     let list_style_position = styles.clone_list_style_position();
     let marker = marker_for_style(list_style_type, index)?;
 
-    let position = match list_style_position {
-        ListStylePosition::Inside => ListItemLayoutPosition::Inside,
+    let (marker, position) = match list_style_position {
+        ListStylePosition::Inside => (marker, ListItemLayoutPosition::Inside),
         ListStylePosition::Outside => {
             let mut parley_style = stylo_to_parley::style(child_id, &styles);
 
-            if let Some(font_stack) = font_for_bullet_style(list_style_type) {
+            // Create a parley tree builder
+            let mut font_ctx = doc.font_ctx.lock().unwrap();
+
+            // Symbol markers use the dedicated `Bullet` face when the document has it (Blitz's own font
+            // context registers it). A host that supplies its own `FontContext` (fulgur, with only the
+            // bundled faces) does not, and neither `monospace` nor `sans-serif` resolves to anything
+            // without system fonts, so the run was dropped and no bullet was painted. Then the marker is
+            // shaped with the item's own font, which is what CSS Lists 3 §3.1 says `::marker` inherits,
+            // and carries the trailing space that `Bullet`'s advance used to provide (the inside path
+            // does the same in `construct.rs`).
+            let has_bullet_face = font_ctx.collection.family_id("Bullet").is_some();
+            let (marker, bullet_stack) = outside_marker(list_style_type, marker, has_bullet_face);
+            if let Some(font_stack) = bullet_stack {
                 parley_style.font_stack = font_stack;
             }
 
-            // Create a parley tree builder
-            let mut font_ctx = doc.font_ctx.lock().unwrap();
             let mut builder = doc.layout_ctx.tree_builder(
                 &mut font_ctx,
                 doc.viewport.scale(),
@@ -100,7 +110,7 @@ fn node_list_item_child(
             let width = layout.calculate_content_widths().max;
             layout.break_all_lines(Some(width));
 
-            ListItemLayoutPosition::Outside(Box::new(layout))
+            (marker, ListItemLayoutPosition::Outside(Box::new(layout)))
         }
     };
 
@@ -132,6 +142,22 @@ fn marker_for_style(list_style_type: ListStyleType, index: usize) -> Option<Mark
         ListStyleType::DisclosureClosed => Marker::Char('▸'),
         _ => Marker::Char('□'),
     })
+}
+
+// The marker text and the font stack override for an outside marker.
+//
+// With the `Bullet` face registered the symbol is laid out alone in that face. Without it the symbol is laid out
+// in the item's own face (no override) and followed by a space, which is the gap to the text.
+fn outside_marker(
+    list_style_type: ListStyleType,
+    marker: Marker,
+    has_bullet_face: bool,
+) -> (Marker, Option<FontStack<'static>>) {
+    match (font_for_bullet_style(list_style_type), marker) {
+        (Some(stack), marker) if has_bullet_face => (marker, Some(stack)),
+        (Some(_), Marker::Char(c)) => (Marker::String(format!("{c} ")), None),
+        (_, marker) => (marker, None),
+    }
 }
 
 // Override the font to our specific bullet font when rendering bullets
@@ -199,4 +225,35 @@ fn test_marker_for_upper_alpha() {
     assert_eq!(result_2, Some(Marker::String("B. ".to_string())));
     assert_eq!(result_extended_1, Some(Marker::String("AA. ".to_string())));
     assert_eq!(result_extended_2, Some(Marker::String("AB. ".to_string())));
+}
+
+#[test]
+fn outside_marker_with_bullet_face_is_unchanged() {
+    let (marker, stack) = outside_marker(ListStyleType::Disc, Marker::Char('•'), true);
+    assert_eq!(marker, Marker::Char('•'));
+    assert!(stack.is_some());
+}
+
+#[test]
+fn outside_marker_without_bullet_face_uses_the_item_font_and_a_trailing_space() {
+    for (list_style_type, symbol) in [
+        (ListStyleType::Disc, '•'),
+        (ListStyleType::Circle, '◦'),
+        (ListStyleType::Square, '▪'),
+    ] {
+        let (marker, stack) = outside_marker(list_style_type, Marker::Char(symbol), false);
+        assert_eq!(marker, Marker::String(format!("{symbol} ")));
+        assert!(stack.is_none(), "{symbol}: the item's own stack is kept");
+    }
+}
+
+#[test]
+fn outside_numbered_marker_is_never_touched() {
+    let numbered = Marker::String("1. ".to_string());
+    for has_bullet_face in [false, true] {
+        let (marker, stack) =
+            outside_marker(ListStyleType::Decimal, numbered.clone(), has_bullet_face);
+        assert_eq!(marker, numbered);
+        assert!(stack.is_none());
+    }
 }
