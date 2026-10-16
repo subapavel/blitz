@@ -300,6 +300,12 @@ impl BaseDocument {
             {
                 node.style.size.width = taffy::Dimension::auto();
             }
+            // A cell's length `height` is a minimum and its `max-height` is ignored (see
+            // `layout/table.rs`): the cell is measured and laid out through this style, so it must not be
+            // clamped below its content.
+            if style.clone_display().inside() == DisplayInside::TableCell {
+                super::table::height_as_table_minimum(&mut node.style);
+            }
             if let Some(element) = node.data.downcast_element() {
                 let tag = element.name.local.as_ref();
                 // HTML §15.4.3: the `width` / `height` attributes of an <img> are presentational hints,

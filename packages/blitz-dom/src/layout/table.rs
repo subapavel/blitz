@@ -59,6 +59,8 @@ pub(crate) fn build_table_context(
     let mut style = stylo_taffy::to_taffy_style(&stylo_styles);
     style.grid_auto_columns = Vec::new();
     style.grid_auto_rows = Vec::new();
+    // A table is at least as tall as its rows (CSS 2.1 §17.5.3): a fixed `height` must not clip them.
+    height_as_table_minimum(&mut style);
 
     let is_fixed = match stylo_styles.clone_table_layout() {
         TableLayout::Fixed => true,
