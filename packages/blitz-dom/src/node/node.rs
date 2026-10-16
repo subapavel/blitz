@@ -112,6 +112,11 @@ pub struct Node {
     pub cache: Cache,
     pub unrounded_layout: Layout,
     pub final_layout: Layout,
+    /// For a table cell: how far (CSS px) `vertical-align: middle | bottom` moved the cell's content down
+    /// in the cell's latest `PerformLayout`. The cell box keeps the row's height; the offset is added to
+    /// the top padding of the cell's layout so that consumers placing inline content (which has no child
+    /// boxes to shift) see it. Zero for every other node.
+    pub table_cell_offset: f32,
     pub scroll_offset: crate::Point<f64>,
 }
 
@@ -153,6 +158,7 @@ impl Node {
             cache: Cache::new(),
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
+            table_cell_offset: 0.0,
             scroll_offset: crate::Point::ZERO,
         }
     }
