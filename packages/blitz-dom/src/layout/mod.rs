@@ -282,8 +282,25 @@ fn compute_node_layout(
                     attr_size,
                 };
 
+                // Taffy's block layout hands every non-table in-flow child the container's width as a
+                // known width when its `width` is `auto` (taffy `compute/block.rs`, "TODO: Allow
+                // stretch-sizing to be conditional"). That is right for a non-replaced box, but a
+                // replaced box with `width: auto` is not stretched: CSS 2.1 §10.3.4 sizes a block-level
+                // replaced element by the inline-replaced rules of §10.3.2 (natural width, or the height
+                // times the ratio), and §10.4 then applies `min-width`/`max-width`, so Tailwind's
+                // `img { max-width: 100% }` still clamps. Block layout is the only caller that sets
+                // `vertical_margins_are_collapsible`, so flex and grid items (which stretch by their
+                // own rules) and absolutely positioned boxes keep the known width they are given.
+                let mut known_dimensions = inputs.known_dimensions;
+                if inputs.vertical_margins_are_collapsible.start
+                    && inputs.vertical_margins_are_collapsible.end
+                    && node.style.size.width.is_auto()
+                {
+                    known_dimensions.width = None;
+                }
+
                 let computed = replaced_measure_function(
-                    inputs.known_dimensions,
+                    known_dimensions,
                     inputs.parent_size,
                     inputs.available_space,
                     &replaced_context,
