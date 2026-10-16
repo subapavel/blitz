@@ -233,6 +233,25 @@ pub(crate) fn collect_table_cells(
                 end: style_helpers::span(1),
             };
             style.size.width = style_helpers::auto();
+            // A cell's `height` is a minimum for its row (CSS 2.1 §17.5.3). Express it as `min-height`
+            // and let the grid stretch the cell, so that `vertical-align` applies to it like to its
+            // siblings. Left alone when it is not a plain length or the cell has another kind of min.
+            if !style.size.height.into_raw().is_calc()
+                && style.size.height.tag() == taffy::CompactLength::LENGTH_TAG
+                && !style.min_size.height.into_raw().is_calc()
+            {
+                let height = style.size.height.value();
+                let min = style.min_size.height;
+                let merged = match min.tag() {
+                    taffy::CompactLength::AUTO_TAG => Some(height),
+                    taffy::CompactLength::LENGTH_TAG => Some(min.value().max(height)),
+                    _ => None,
+                };
+                if let Some(merged) = merged {
+                    style.min_size.height = style_helpers::length(merged);
+                    style.size.height = style_helpers::auto();
+                }
+            }
             cells.push(TableItem {
                 kind: TableItemKind::Cell,
                 node_id,
