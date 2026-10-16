@@ -516,40 +516,8 @@ fn collect_complex_layout_children(
         // Push nodes that need wrapping into the current "anonymous block container".
         // If there is not an open one then we create one.
         else if needs_wrap(child_node_kind, display_outside) {
-            use style::selector_parser::PseudoElement;
-
             if anonymous_block_id.is_none() {
-                const NAME: QualName = QualName {
-                    prefix: None,
-                    ns: ns!(html),
-                    local: local_name!("div"),
-                };
-                let node_id =
-                    doc.create_node(NodeData::AnonymousBlock(ElementData::new(NAME, Vec::new())));
-
-                // Set style data
-                let parent_style = doc.nodes[container_node_id].primary_styles().unwrap();
-                let read_guard = doc.guard.read();
-                let guards = StylesheetGuards::same(&read_guard);
-                let style = doc.stylist.style_for_anonymous::<&Node>(
-                    &guards,
-                    &PseudoElement::ServoAnonymousBox,
-                    &parent_style,
-                );
-                let mut stylo_element_data = StyloElementData {
-                    damage: ALL_DAMAGE,
-                    ..Default::default()
-                };
-                drop(parent_style);
-
-                stylo_element_data.styles.primary = Some(style);
-                stylo_element_data.set_restyled();
-                *doc.nodes[node_id].stylo_element_data.borrow_mut() = Some(stylo_element_data);
-                doc.nodes[node_id].parent = Some(container_node_id);
-                doc.nodes[node_id]
-                    .layout_parent
-                    .set(Some(container_node_id));
-
+                let node_id = create_anonymous_block(doc, container_node_id);
                 layout_children.push(node_id);
                 *anonymous_block_id = Some(node_id);
             }
@@ -582,6 +550,42 @@ fn collect_complex_layout_children(
             *anonymous_block_id = None;
         }
     }
+}
+
+/// Creates an anonymous block box whose style inherits from `style_parent` (`ServoAnonymousBox`, so its computed
+/// `display` is the initial `inline`) and whose `parent` and `layout_parent` are `style_parent`. The caller
+/// pushes it into the layout children of its parent and fills its `children`.
+pub(crate) fn create_anonymous_block(doc: &mut BaseDocument, style_parent: usize) -> usize {
+    use style::selector_parser::PseudoElement;
+
+    const NAME: QualName = QualName {
+        prefix: None,
+        ns: ns!(html),
+        local: local_name!("div"),
+    };
+    let node_id = doc.create_node(NodeData::AnonymousBlock(ElementData::new(NAME, Vec::new())));
+
+    // Set style data
+    let parent_style = doc.nodes[style_parent].primary_styles().unwrap();
+    let read_guard = doc.guard.read();
+    let guards = StylesheetGuards::same(&read_guard);
+    let style = doc.stylist.style_for_anonymous::<&Node>(
+        &guards,
+        &PseudoElement::ServoAnonymousBox,
+        &parent_style,
+    );
+    let mut stylo_element_data = StyloElementData {
+        damage: ALL_DAMAGE,
+        ..Default::default()
+    };
+    drop(parent_style);
+
+    stylo_element_data.styles.primary = Some(style);
+    stylo_element_data.set_restyled();
+    *doc.nodes[node_id].stylo_element_data.borrow_mut() = Some(stylo_element_data);
+    doc.nodes[node_id].parent = Some(style_parent);
+    doc.nodes[node_id].layout_parent.set(Some(style_parent));
+    node_id
 }
 
 fn create_text_editor(doc: &mut BaseDocument, input_element_id: usize, is_multiline: bool) {

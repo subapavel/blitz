@@ -10,9 +10,10 @@ use taffy::{
 };
 
 use crate::BaseDocument;
-use crate::node::Node;
+use crate::node::{Node, NodeData};
 
 use super::compute_node_layout;
+use super::construct::create_anonymous_block;
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use super::resolve_calc_value;
 
@@ -44,10 +45,6 @@ pub(crate) fn build_table_context(
     doc: &mut BaseDocument,
     table_root_node_id: usize,
 ) -> (TableContext, Vec<usize>) {
-    let mut items: Vec<TableItem> = Vec::new();
-    let mut row = 0u16;
-    let mut col = 0u16;
-
     let root_node = &mut doc.nodes[table_root_node_id];
 
     let children = std::mem::take(&mut root_node.children);
@@ -70,18 +67,21 @@ pub(crate) fn build_table_context(
 
     drop(stylo_styles);
 
-    let mut column_sizes: Vec<taffy::Dimension> = Vec::new();
-    for child_id in children.iter().copied() {
-        collect_table_cells(
-            doc,
-            child_id,
-            is_fixed,
-            &mut row,
-            &mut col,
-            &mut items,
-            &mut column_sizes,
-        );
-    }
+    let mut grid = GridBuilder {
+        is_fixed,
+        row: 0,
+        col: 0,
+        items: Vec::new(),
+        columns: Vec::new(),
+    };
+    collect_table_children(doc, table_root_node_id, &children, Level::Table, &mut grid);
+    let GridBuilder {
+        row,
+        col,
+        items,
+        columns: mut column_sizes,
+        ..
+    } = grid;
     column_sizes.resize(col as usize, style_helpers::auto());
 
     style.grid_template_columns = column_sizes
@@ -163,155 +163,375 @@ pub(crate) fn grid_container_min_height(style: &mut taffy::Style<Atom>) {
     style.min_size.height = style_helpers::length(style.min_size.height.value() - frame);
 }
 
-pub(crate) fn collect_table_cells(
-    doc: &mut BaseDocument,
-    node_id: usize,
-    is_fixed: bool,
-    row: &mut u16,
-    col: &mut u16,
-    cells: &mut Vec<TableItem>,
-    columns: &mut Vec<Dimension>,
-) {
+/// Adds the table cell `node_id` (a `display: table-cell` element, or an anonymous cell) to the grid: its column
+/// track from the first row's widths (or a wider `width` below it), its grid position, and its style as a grid item.
+fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
     let node = &doc.nodes[node_id];
+    let stylo_style = &node.primary_styles().unwrap();
+    let colspan: u16 = node
+        .attr(local_name!("colspan"))
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(1);
+    let mut style = stylo_taffy::to_taffy_style(stylo_style);
 
-    if !node.is_element() {
-        return;
+    // TODO: account for padding/border/margin
+    if grid.row == 1 {
+        // A `calc()` that survives Stylo's simplification mixes a percentage and a non-zero length;
+        // on a table cell it MUST be treated as `auto` (css-values-4 § Computed Value of math
+        // expressions). `tag()` of a calc value is not a valid tag, so test it first.
+        let column = if style.size.width.into_raw().is_calc() {
+            style_helpers::auto()
+        } else {
+            match style.size.width.tag() {
+                taffy::CompactLength::LENGTH_TAG => {
+                    style_helpers::length(cell_border_box_width(&style))
+                }
+                taffy::CompactLength::PERCENT_TAG => {
+                    style_helpers::percent(style.size.width.value())
+                }
+                taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
+                _ => unreachable!(),
+            }
+        };
+        grid.columns.push(column);
+    } else if !grid.is_fixed
+        && (grid.col as usize) < grid.columns.len()
+        && taffy::CompactLength::LENGTH_TAG == style.size.width.tag()
+    {
+        let new_len = cell_border_box_width(&style);
+        let tag = grid.columns[grid.col as usize].tag();
+        let value = grid.columns[grid.col as usize].value();
+        grid.columns[grid.col as usize] = match tag {
+            taffy::CompactLength::LENGTH_TAG => style_helpers::length(value.max(new_len)),
+            taffy::CompactLength::AUTO_TAG => style_helpers::length(new_len),
+            taffy::CompactLength::PERCENT_TAG => style_helpers::percent(value),
+            _ => unreachable!(),
+        }
     }
 
-    let Some(display) = node.primary_styles().map(|s| s.clone_display()) else {
-        println!("Ignoring table descendent because it has no styles");
-        return;
+    style.grid_column = taffy::Line {
+        start: style_helpers::line((grid.col + 1) as i16),
+        end: style_helpers::span(colspan),
     };
+    style.grid_row = taffy::Line {
+        start: style_helpers::line(grid.row as i16),
+        end: style_helpers::span(1),
+    };
+    style.size.width = style_helpers::auto();
+    height_as_table_minimum(&mut style);
+    grid.items.push(TableItem {
+        kind: TableItemKind::Cell,
+        node_id,
+        style,
+    });
 
-    if display.outside() == DisplayOutside::None {
-        node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-        return;
+    grid.col += colspan;
+}
+
+/// What a child of a table, a row group or a row is, by its computed `display` and not its tag (css-display-3 §2.4:
+/// the table role comes from `display`; HTML §15.3.8's `td { display: table-cell }` is overridden by author CSS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TablePart {
+    /// `table-cell`.
+    Cell,
+    /// `table-row`.
+    Row,
+    /// `table-row-group`, `table-header-group`, `table-footer-group`.
+    RowGroup,
+    /// `table-column`, `table-column-group`: no box in the grid, skipped.
+    Column,
+    /// `table-caption`: skipped (fulgur moves a `<caption>` out of the table before Blitz sees it).
+    Caption,
+    /// `display: none` (or an element without styles): no box, skipped, never opens a run.
+    Hidden,
+    /// Whitespace-only text and comments: never opens a run (CSS 2.1 §17.2.1 rule 1), kept inside one.
+    Whitespace,
+    /// Everything else: a block, flex, grid, inline or list-item box, a nested table, a table part of the wrong
+    /// kind for its parent, non-whitespace text. It is wrapped in an anonymous table object.
+    Other,
+}
+
+/// The kind of container whose children are planned: the table itself or a row group. (A row is planned by
+/// [`plan_row`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Level {
+    Table,
+    RowGroup,
+}
+
+/// What becomes of the children of a row: a child that is a cell, or a run of consecutive children that are
+/// not (one anonymous cell). Indices are into the flattened child list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowSlot {
+    Cell(usize),
+    AnonymousCell(Range<usize>),
+}
+
+/// What becomes of the children of a table or a row group: a child that is a row (or, in a table, a row
+/// group), or a run of consecutive children that are neither (one anonymous row, with the slots of its cells).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Keep(usize),
+    AnonymousRow(Vec<RowSlot>),
+}
+
+/// Classifies `node` by its computed `display`. See [`TablePart`].
+fn table_part_of(node: &Node) -> TablePart {
+    match &node.data {
+        NodeData::Text(text) => {
+            if text.content.chars().all(|c| c.is_ascii_whitespace()) {
+                TablePart::Whitespace
+            } else {
+                TablePart::Other
+            }
+        }
+        NodeData::Comment => TablePart::Whitespace,
+        NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
+            let Some(display) = node.primary_styles().map(|s| s.clone_display()) else {
+                println!("Ignoring table descendent because it has no styles");
+                return TablePart::Hidden;
+            };
+            if display.outside() == DisplayOutside::None {
+                return TablePart::Hidden;
+            }
+            if display.outside() == DisplayOutside::TableCaption {
+                return TablePart::Caption;
+            }
+            match display.inside() {
+                DisplayInside::TableCell => TablePart::Cell,
+                DisplayInside::TableRow => TablePart::Row,
+                DisplayInside::TableRowGroup
+                | DisplayInside::TableHeaderGroup
+                | DisplayInside::TableFooterGroup => TablePart::RowGroup,
+                DisplayInside::TableColumnGroup | DisplayInside::TableColumn => TablePart::Column,
+                _ => TablePart::Other,
+            }
+        }
+        _ => TablePart::Hidden,
     }
+}
 
-    match display.inside() {
-        DisplayInside::TableRowGroup
-        | DisplayInside::TableHeaderGroup
-        | DisplayInside::TableFooterGroup
-        | DisplayInside::Contents => {
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
-            for child_id in children.iter().copied() {
-                doc.nodes[child_id]
-                    .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns);
-            }
-            doc.nodes[node_id].children = children;
+/// `ids` with every `display: contents` element replaced by its children (recursively): they take part in the
+/// parent's table fixup as if the element were not there (css-display-3 §2.5).
+fn flatten_contents(doc: &BaseDocument, ids: &[usize], out: &mut Vec<usize>) {
+    for &id in ids {
+        let node = &doc.nodes[id];
+        let is_contents = node.is_element()
+            && node
+                .primary_styles()
+                .is_some_and(|s| s.clone_display().inside() == DisplayInside::Contents);
+        if is_contents {
+            flatten_contents(doc, &node.children, out);
+        } else {
+            out.push(id);
         }
-        DisplayInside::TableRow => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            *row += 1;
-            *col = 0;
+    }
+}
 
-            {
-                let stylo_style = &node.primary_styles().unwrap();
-                let mut style = stylo_taffy::to_taffy_style(stylo_style);
-                style.grid_column = taffy::Line {
-                    start: style_helpers::line(0),
-                    end: style_helpers::line(-1),
-                };
-                style.grid_row = taffy::Line {
-                    start: style_helpers::line(*row as i16),
-                    end: style_helpers::span(1),
-                };
-                cells.push(TableItem {
-                    kind: TableItemKind::Row,
-                    node_id,
-                    style,
-                });
-            }
-
-            let children = std::mem::take(&mut doc.nodes[node_id].children);
-            for child_id in children.iter().copied() {
-                collect_table_cells(doc, child_id, is_fixed, row, col, cells, columns);
-            }
-            doc.nodes[node_id].children = children;
+/// Plans the children `parts[range]` of one row (CSS 2.1 §17.2.1 rule 2, "missing wrappers"): a cell stays a
+/// cell, and each run of consecutive children that are not cells gets one anonymous cell. A run starts at a
+/// child that is not whitespace, hidden, a column or a caption; hidden boxes and whitespace inside it stay in
+/// it, the ones at its end are left out. A column or caption ends a run and is skipped.
+fn plan_row(parts: &[TablePart], range: Range<usize>) -> Vec<RowSlot> {
+    fn close(run: &mut Option<Range<usize>>, slots: &mut Vec<RowSlot>) {
+        if let Some(run) = run.take() {
+            slots.push(RowSlot::AnonymousCell(run));
         }
-        DisplayInside::TableCell => {
-            // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            let stylo_style = &node.primary_styles().unwrap();
-            let colspan: u16 = node
-                .attr(local_name!("colspan"))
-                .and_then(|val| val.parse().ok())
-                .unwrap_or(1);
-            let mut style = stylo_taffy::to_taffy_style(stylo_style);
+    }
+    let mut slots = Vec::new();
+    let mut run: Option<Range<usize>> = None;
+    for i in range {
+        match parts[i] {
+            TablePart::Cell => {
+                close(&mut run, &mut slots);
+                slots.push(RowSlot::Cell(i));
+            }
+            TablePart::Column | TablePart::Caption => close(&mut run, &mut slots),
+            TablePart::Hidden | TablePart::Whitespace => {}
+            TablePart::Row | TablePart::RowGroup | TablePart::Other => match &mut run {
+                Some(run) => run.end = i + 1,
+                None => run = Some(i..i + 1),
+            },
+        }
+    }
+    close(&mut run, &mut slots);
+    slots
+}
 
-            // TODO: account for padding/border/margin
-            if *row == 1 {
-                // A `calc()` that survives Stylo's simplification mixes a percentage and a non-zero length;
-                // on a table cell it MUST be treated as `auto` (css-values-4 § Computed Value of math
-                // expressions). `tag()` of a calc value is not a valid tag, so test it first.
-                let column = if style.size.width.into_raw().is_calc() {
-                    style_helpers::auto()
+/// Plans the children of a table (`Level::Table`) or a row group (`Level::RowGroup`) (CSS 2.1 §17.2.1 rule 2):
+/// a row stays (so does a row group in a table), and each run of consecutive children that are not rows (cells,
+/// boxes of any other display, text) gets one anonymous row, whose own children are planned like a row's. Hidden
+/// boxes, whitespace, columns and captions are handled as in [`plan_row`].
+pub(crate) fn plan_table_children(level: Level, parts: &[TablePart]) -> Vec<Slot> {
+    fn close(parts: &[TablePart], run: &mut Option<Range<usize>>, slots: &mut Vec<Slot>) {
+        if let Some(run) = run.take() {
+            slots.push(Slot::AnonymousRow(plan_row(parts, run)));
+        }
+    }
+    let mut slots = Vec::new();
+    let mut run: Option<Range<usize>> = None;
+    for (i, part) in parts.iter().enumerate() {
+        match part {
+            TablePart::Row => {
+                close(parts, &mut run, &mut slots);
+                slots.push(Slot::Keep(i));
+            }
+            TablePart::RowGroup if level == Level::Table => {
+                close(parts, &mut run, &mut slots);
+                slots.push(Slot::Keep(i));
+            }
+            TablePart::Column | TablePart::Caption => close(parts, &mut run, &mut slots),
+            TablePart::Hidden | TablePart::Whitespace => {}
+            TablePart::Cell | TablePart::RowGroup | TablePart::Other => match &mut run {
+                Some(run) => run.end = i + 1,
+                None => run = Some(i..i + 1),
+            },
+        }
+    }
+    close(parts, &mut run, &mut slots);
+    slots
+}
+
+/// The grid being built from a table's parts: the position of the next cell and what has been collected.
+struct GridBuilder {
+    is_fixed: bool,
+    row: u16,
+    col: u16,
+    items: Vec<TableItem>,
+    columns: Vec<Dimension>,
+}
+
+/// Hidden boxes, columns and captions are not constructed: they have no box in the table.
+fn release_skipped(doc: &BaseDocument, ids: &[usize], parts: &[TablePart]) {
+    for (&id, part) in ids.iter().zip(parts) {
+        if matches!(
+            part,
+            TablePart::Hidden | TablePart::Column | TablePart::Caption
+        ) {
+            doc.nodes[id].remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+        }
+    }
+}
+
+/// Collects the children `children` of the table (`parent_id`, whose own `children` were taken by the caller) or
+/// of a row group into `grid`. Returns the layout children of the container (its rows and the cells of its
+/// anonymous rows, in DOM order) and whether there is an anonymous row among them.
+fn collect_table_children(
+    doc: &mut BaseDocument,
+    parent_id: usize,
+    children: &[usize],
+    level: Level,
+    grid: &mut GridBuilder,
+) -> (Vec<usize>, bool) {
+    let mut ids = Vec::with_capacity(children.len());
+    flatten_contents(doc, children, &mut ids);
+    let parts: Vec<TablePart> = ids
+        .iter()
+        .map(|&id| table_part_of(&doc.nodes[id]))
+        .collect();
+    release_skipped(doc, &ids, &parts);
+
+    let mut layout_children = Vec::new();
+    let mut has_anonymous = false;
+    for slot in plan_table_children(level, &parts) {
+        match slot {
+            Slot::Keep(i) => {
+                let id = ids[i];
+                if parts[i] == TablePart::Row {
+                    collect_row(doc, id, grid);
+                    layout_children.push(id);
                 } else {
-                    match style.size.width.tag() {
-                        taffy::CompactLength::LENGTH_TAG => {
-                            style_helpers::length(cell_border_box_width(&style))
-                        }
-                        taffy::CompactLength::PERCENT_TAG => {
-                            style_helpers::percent(style.size.width.value())
-                        }
-                        taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
-                        _ => unreachable!(),
-                    }
-                };
-                columns.push(column);
-            } else if !is_fixed
-                && (*col as usize) < columns.len()
-                && taffy::CompactLength::LENGTH_TAG == style.size.width.tag()
-            {
-                let new_len = cell_border_box_width(&style);
-                let tag = columns[*col as usize].tag();
-                let value = columns[*col as usize].value();
-                columns[*col as usize] = match tag {
-                    taffy::CompactLength::LENGTH_TAG => style_helpers::length(value.max(new_len)),
-                    taffy::CompactLength::AUTO_TAG => style_helpers::length(new_len),
-                    taffy::CompactLength::PERCENT_TAG => style_helpers::percent(value),
-                    _ => unreachable!(),
+                    collect_row_group(doc, id, grid);
                 }
             }
-
-            style.grid_column = taffy::Line {
-                start: style_helpers::line((*col + 1) as i16),
-                end: style_helpers::span(colspan),
-            };
-            style.grid_row = taffy::Line {
-                start: style_helpers::line(*row as i16),
-                end: style_helpers::span(1),
-            };
-            style.size.width = style_helpers::auto();
-            height_as_table_minimum(&mut style);
-            cells.push(TableItem {
-                kind: TableItemKind::Cell,
-                node_id,
-                style,
-            });
-
-            *col += colspan;
-        }
-        DisplayInside::Flow
-        | DisplayInside::FlowRoot
-        | DisplayInside::Flex
-        | DisplayInside::Grid => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Probably a table caption: ignore
-            // println!(
-            //     "Warning: ignoring non-table typed descendent of table ({:?})",
-            //     display.inside()
-            // );
-        }
-        DisplayInside::TableColumnGroup | DisplayInside::TableColumn | DisplayInside::Table => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            //Ignore
-        }
-        DisplayInside::None => {
-            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-            // Ignore
+            Slot::AnonymousRow(slots) => {
+                grid.row += 1;
+                grid.col = 0;
+                has_anonymous = true;
+                layout_children.extend(push_row_slots(doc, parent_id, &ids, &slots, grid));
+            }
         }
     }
+    (layout_children, has_anonymous)
+}
+
+fn collect_row_group(doc: &mut BaseDocument, group_id: usize, grid: &mut GridBuilder) {
+    let children = std::mem::take(&mut doc.nodes[group_id].children);
+    let (layout_children, has_anonymous) =
+        collect_table_children(doc, group_id, &children, Level::RowGroup, grid);
+    let group = &mut doc.nodes[group_id];
+    group.children = children;
+    // Rows and the cells of anonymous rows, so that a walk over the layout children finds them all.
+    *group.layout_children.borrow_mut() = has_anonymous.then_some(layout_children);
+}
+
+fn collect_row(doc: &mut BaseDocument, row_id: usize, grid: &mut GridBuilder) {
+    let node = &doc.nodes[row_id];
+    node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+    grid.row += 1;
+    grid.col = 0;
+
+    {
+        let stylo_style = &node.primary_styles().unwrap();
+        let mut style = stylo_taffy::to_taffy_style(stylo_style);
+        style.grid_column = taffy::Line {
+            start: style_helpers::line(0),
+            end: style_helpers::line(-1),
+        };
+        style.grid_row = taffy::Line {
+            start: style_helpers::line(grid.row as i16),
+            end: style_helpers::span(1),
+        };
+        grid.items.push(TableItem {
+            kind: TableItemKind::Row,
+            node_id: row_id,
+            style,
+        });
+    }
+
+    let children = std::mem::take(&mut doc.nodes[row_id].children);
+    let mut ids = Vec::with_capacity(children.len());
+    flatten_contents(doc, &children, &mut ids);
+    let parts: Vec<TablePart> = ids
+        .iter()
+        .map(|&id| table_part_of(&doc.nodes[id]))
+        .collect();
+    release_skipped(doc, &ids, &parts);
+    let slots = plan_row(&parts, 0..ids.len());
+    let has_anonymous = slots
+        .iter()
+        .any(|slot| matches!(slot, RowSlot::AnonymousCell(_)));
+    let layout_children = push_row_slots(doc, row_id, &ids, &slots, grid);
+    let row = &mut doc.nodes[row_id];
+    row.children = children;
+    // The cells in DOM order, the anonymous ones included; a row without one keeps walking its `children`.
+    *row.layout_children.borrow_mut() = has_anonymous.then_some(layout_children);
+}
+
+/// Adds the cells of `slots` to the grid in order and returns their node ids. An anonymous cell is a new
+/// anonymous block that adopts the run `ids[range]` as its children; it inherits from `style_parent` (the row,
+/// or the container of an anonymous row) and has no padding, border or width of its own.
+fn push_row_slots(
+    doc: &mut BaseDocument,
+    style_parent: usize,
+    ids: &[usize],
+    slots: &[RowSlot],
+    grid: &mut GridBuilder,
+) -> Vec<usize> {
+    let mut cells = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let cell_id = match slot {
+            RowSlot::Cell(i) => ids[*i],
+            RowSlot::AnonymousCell(run) => {
+                let anonymous = create_anonymous_block(doc, style_parent);
+                doc.nodes[anonymous].children = ids[run.clone()].to_vec();
+                anonymous
+            }
+        };
+        push_cell_item(doc, cell_id, grid);
+        cells.push(cell_id);
+    }
+    cells
 }
 
 /// How much of a table cell's free vertical space goes above its content, from the cell's
@@ -611,5 +831,158 @@ mod tests {
             grid_container_min_height(&mut style);
             assert_eq!(style.min_size.height, min);
         }
+    }
+
+    use TablePart::{Caption, Cell, Column, Hidden, Other, Row, RowGroup, Whitespace};
+
+    #[test]
+    fn plan_row_keeps_cells_and_wraps_each_run_of_other_children() {
+        // cell, run of two, cell, run of one
+        let parts = [Cell, Other, Other, Cell, Other];
+        assert_eq!(
+            plan_row(&parts, 0..parts.len()),
+            vec![
+                RowSlot::Cell(0),
+                RowSlot::AnonymousCell(1..3),
+                RowSlot::Cell(3),
+                RowSlot::AnonymousCell(4..5),
+            ]
+        );
+        assert_eq!(
+            plan_row(&[Cell, Cell], 0..2),
+            vec![RowSlot::Cell(0), RowSlot::Cell(1)]
+        );
+        assert_eq!(plan_row(&[], 0..0), vec![]);
+    }
+
+    #[test]
+    fn plan_row_trims_whitespace_and_hidden_boxes_at_the_ends_of_a_run_only() {
+        // Whitespace never opens a run, stays inside one, and trailing ones are dropped.
+        let parts = [
+            Whitespace, Cell, Whitespace, Other, Whitespace, Hidden, Other, Whitespace, Hidden,
+            Cell,
+        ];
+        assert_eq!(
+            plan_row(&parts, 0..parts.len()),
+            vec![
+                RowSlot::Cell(1),
+                RowSlot::AnonymousCell(3..7),
+                RowSlot::Cell(9),
+            ]
+        );
+        // Nothing but whitespace and hidden boxes: no cell at all.
+        assert_eq!(plan_row(&[Whitespace, Hidden, Whitespace], 0..3), vec![]);
+    }
+
+    #[test]
+    fn plan_row_skips_columns_and_captions_and_they_end_a_run() {
+        let parts = [Other, Column, Other, Caption, Cell];
+        assert_eq!(
+            plan_row(&parts, 0..parts.len()),
+            vec![
+                RowSlot::AnonymousCell(0..1),
+                RowSlot::AnonymousCell(2..3),
+                RowSlot::Cell(4),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_row_wraps_a_misplaced_row_or_row_group_like_any_other_box() {
+        let parts = [Row, RowGroup, Cell];
+        assert_eq!(
+            plan_row(&parts, 0..3),
+            vec![RowSlot::AnonymousCell(0..2), RowSlot::Cell(2)]
+        );
+    }
+
+    #[test]
+    fn plan_row_plans_only_its_range() {
+        let parts = [Other, Cell, Other, Other];
+        assert_eq!(plan_row(&parts, 2..4), vec![RowSlot::AnonymousCell(2..4)]);
+    }
+
+    #[test]
+    fn a_table_keeps_rows_and_row_groups() {
+        let parts = [Whitespace, RowGroup, Whitespace, Row, Whitespace, RowGroup];
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![Slot::Keep(1), Slot::Keep(3), Slot::Keep(5)]
+        );
+    }
+
+    #[test]
+    fn a_table_wraps_a_run_of_cells_in_one_anonymous_row() {
+        // Two bare cells, then a row: the cells share an anonymous row, the row follows.
+        let parts = [Cell, Cell, Row, Cell];
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![
+                Slot::AnonymousRow(vec![RowSlot::Cell(0), RowSlot::Cell(1)]),
+                Slot::Keep(2),
+                Slot::AnonymousRow(vec![RowSlot::Cell(3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_wraps_other_boxes_in_an_anonymous_row_and_an_anonymous_cell() {
+        // Missing wrappers apply twice: a `tbody { display: block }` is not a row, so it gets an anonymous row;
+        // it is not a cell either, so that row gets an anonymous cell. Cells in the same run stay cells.
+        let parts = [Row, Other, Whitespace, Other, Cell, Whitespace, Row];
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![
+                Slot::Keep(0),
+                Slot::AnonymousRow(vec![RowSlot::AnonymousCell(1..4), RowSlot::Cell(4)]),
+                Slot::Keep(6),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_group_wraps_a_nested_row_group_but_a_table_does_not() {
+        let parts = [Row, RowGroup, Row];
+        assert_eq!(
+            plan_table_children(Level::RowGroup, &parts),
+            vec![
+                Slot::Keep(0),
+                Slot::AnonymousRow(vec![RowSlot::AnonymousCell(1..2)]),
+                Slot::Keep(2),
+            ]
+        );
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)]
+        );
+    }
+
+    #[test]
+    fn a_table_skips_captions_columns_and_hidden_boxes() {
+        let parts = [Caption, Column, Hidden, Row, Hidden, Whitespace];
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![Slot::Keep(3)]
+        );
+        // They end a run: two boxes around a column are two anonymous rows.
+        let parts = [Other, Column, Other];
+        assert_eq!(
+            plan_table_children(Level::Table, &parts),
+            vec![
+                Slot::AnonymousRow(vec![RowSlot::AnonymousCell(0..1)]),
+                Slot::AnonymousRow(vec![RowSlot::AnonymousCell(2..3)]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_without_misparented_children_plans_no_anonymous_row() {
+        // The common case: whitespace between rows and groups is dropped, nothing is wrapped.
+        let parts = [Whitespace, RowGroup, Whitespace, RowGroup, Whitespace];
+        assert!(
+            plan_table_children(Level::Table, &parts)
+                .iter()
+                .all(|slot| matches!(slot, Slot::Keep(_)))
+        );
     }
 }
