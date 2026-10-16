@@ -61,6 +61,7 @@ pub(crate) fn build_table_context(
     style.grid_auto_rows = Vec::new();
     // A table is at least as tall as its rows (CSS 2.1 §17.5.3): a fixed `height` must not clip them.
     height_as_table_minimum(&mut style);
+    grid_container_min_height(&mut style);
 
     let is_fixed = match stylo_styles.clone_table_layout() {
         TableLayout::Fixed => true,
@@ -139,6 +140,27 @@ pub(crate) fn height_as_table_minimum(style: &mut taffy::Style<Atom>) {
             style.size.height = style_helpers::auto();
         }
     }
+}
+
+/// Re-expresses the minimum height of the table's grid container for Taffy, which stretches the grid's auto
+/// rows to a container `min-height` as if it were the size of the content box and only then adds the container's
+/// padding and border (taffy 0.9.2 `compute/grid/mod.rs`; under `content-box` it has also added them to the
+/// minimum before). A table's `height` is a total in Chrome under `border-box` (CSS 2.1 §17.5.3: the table is as
+/// tall as its `height` says, a minimum) and the content box under `content-box`; both come out right when the
+/// minimum handed to Taffy is `height - padding - border`: the rows are stretched to the content box
+/// (`border-box`: the total minus the frame; `content-box`: Taffy adds the frame back to the minimum, which is
+/// the `height` itself) and the container is the rows plus the frame. A percentage padding counts as zero here.
+/// Only for the grid style of the table root, not for its own node style (which the flex and grid algorithms read).
+pub(crate) fn grid_container_min_height(style: &mut taffy::Style<Atom>) {
+    if style.min_size.height.into_raw().is_calc()
+        || style.min_size.height.tag() != taffy::CompactLength::LENGTH_TAG
+    {
+        return;
+    }
+    let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
+    let border = style.border.resolve_or_zero(None, resolve_calc_value);
+    let frame = padding.top + padding.bottom + border.top + border.bottom;
+    style.min_size.height = style_helpers::length(style.min_size.height.value() - frame);
 }
 
 pub(crate) fn collect_table_cells(
@@ -561,5 +583,33 @@ mod tests {
         height_as_table_minimum(&mut style);
         assert_eq!(style.max_size.height, auto());
         assert_eq!(style.min_size.height, length(20.0));
+    }
+
+    fn framed(min: taffy::Dimension, box_sizing: taffy::BoxSizing) -> taffy::Style<Atom> {
+        let mut style = styled(auto(), min, auto());
+        style.box_sizing = box_sizing;
+        style.padding.top = taffy::LengthPercentage::length(10.0);
+        style.padding.bottom = taffy::LengthPercentage::length(10.0);
+        style.border.top = taffy::LengthPercentage::length(6.0);
+        style.border.bottom = taffy::LengthPercentage::length(6.0);
+        style
+    }
+
+    #[test]
+    fn the_grid_minimum_is_the_height_less_the_frame_in_both_box_sizings() {
+        for bs in [taffy::BoxSizing::BorderBox, taffy::BoxSizing::ContentBox] {
+            let mut style = framed(length(100.0), bs);
+            grid_container_min_height(&mut style);
+            assert_eq!(style.min_size.height, length(68.0), "{bs:?}");
+        }
+    }
+
+    #[test]
+    fn the_grid_minimum_leaves_auto_and_percentages_alone() {
+        for min in [auto(), percent(0.5_f32)] {
+            let mut style = framed(min, taffy::BoxSizing::BorderBox);
+            grid_container_min_height(&mut style);
+            assert_eq!(style.min_size.height, min);
+        }
     }
 }
