@@ -291,8 +291,30 @@ fn compute_node_layout(
                 // `img { max-width: 100% }` still clamps. Block layout is the only caller that sets
                 // `vertical_margins_are_collapsible`, so flex and grid items (which stretch by their
                 // own rules) and absolutely positioned boxes keep the known width they are given.
+                //
+                // That holds for an element with a natural width, or one whose height is definite (the
+                // width then follows from the ratio, §10.3.2). An element with only a ratio and an auto
+                // height (an <svg> with a `viewBox` and no `width`, a canvas without attributes) has no
+                // natural width to take, and §10.3.4 makes it as wide as its containing block, so it
+                // keeps the stretched width.
+                let has_natural_width = match &element_data.special_data {
+                    SpecialElementData::Image(image_data) => match &**image_data {
+                        ImageData::Raster(image) => image.width > 0,
+                        #[cfg(feature = "svg")]
+                        ImageData::Svg(_) => {
+                            *element_data.name.local != *"svg"
+                                || element_data.attr(local_name!("viewBox")).is_none()
+                                || element_data
+                                    .attr(local_name!("width"))
+                                    .is_some_and(|width| !width.trim_end().ends_with('%'))
+                        }
+                        ImageData::None => false,
+                    },
+                    _ => false,
+                };
                 let mut known_dimensions = inputs.known_dimensions;
-                if inputs.vertical_margins_are_collapsible.start
+                if (has_natural_width || known_dimensions.height.is_some())
+                    && inputs.vertical_margins_are_collapsible.start
                     && inputs.vertical_margins_are_collapsible.end
                     && node.style.size.width.is_auto()
                 {
