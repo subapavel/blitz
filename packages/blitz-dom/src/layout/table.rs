@@ -1,15 +1,18 @@
 use std::{ops::Range, sync::Arc};
 
 use markup5ever::local_name;
+use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{Atom, computed_values::table_layout::T as TableLayout};
 use taffy::{
-    Dimension, LayoutPartialTree as _, ResolveOrZero, TrackSizingFunction, compute_leaf_layout,
-    style_helpers,
+    Dimension, LayoutInput, LayoutOutput, LayoutPartialTree as _, NodeId, Position, RequestedAxis,
+    ResolveOrZero, RunMode, Size, TrackSizingFunction, compute_leaf_layout, style_helpers,
 };
 
 use crate::BaseDocument;
+use crate::node::Node;
 
+use super::compute_node_layout;
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use super::resolve_calc_value;
 
@@ -260,6 +263,96 @@ pub(crate) fn collect_table_cells(
     }
 }
 
+/// How much of a table cell's free vertical space goes above its content, from the cell's
+/// `vertical-align` (CSS 2.1 §17.5.3): `middle` 1/2, `bottom` 1, everything else 0. `top` is the start;
+/// `baseline` and the remaining values act as `baseline`, which for the cells of one row is the top as
+/// long as every cell starts with a line of the same height (real baseline alignment is not done).
+fn cell_align_factor(node: &Node) -> f32 {
+    let Some(styles) = node.primary_styles() else {
+        return 0.0;
+    };
+    match styles.clone_vertical_align() {
+        VerticalAlign::Keyword(VerticalAlignKeyword::Middle) => 0.5,
+        VerticalAlign::Keyword(VerticalAlignKeyword::Bottom) => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// Whether this layout request is the final layout of a table cell that `vertical-align` moves: a cell
+/// of a table root, stretched to a known row height, with `middle` or `bottom` alignment. Measuring a
+/// cell (`ComputeSize`) never moves content, and a cell without a known height is not stretched.
+pub(crate) fn is_aligned_table_cell(
+    doc: &BaseDocument,
+    node_id: NodeId,
+    inputs: &LayoutInput,
+) -> bool {
+    if inputs.run_mode != RunMode::PerformLayout || inputs.known_dimensions.height.is_none() {
+        return false;
+    }
+    let node = &doc.nodes[usize::from(node_id)];
+    let Some(parent) = node.layout_parent.get() else {
+        return false;
+    };
+    doc.nodes[parent].flags.is_table_root()
+        && node.display_constructed_as.inside() == DisplayInside::TableCell
+        && cell_align_factor(node) > 0.0
+}
+
+/// Lays out a stretched table cell and moves its content down by its share of the free space. The cell
+/// box keeps the row's height (backgrounds and borders still fill the row); only what is inside moves,
+/// as in CSS Tables 3 §3 "intrinsic padding". The offset is stored in `Node::table_cell_offset`;
+/// [`TableTreeWrapper::set_unrounded_layout`] adds it to the top padding of the cell's layout, which is
+/// where inline content (laid out as one paragraph, no child boxes) is placed from.
+pub(crate) fn compute_table_cell_layout(
+    doc: &mut BaseDocument,
+    node_id: NodeId,
+    inputs: LayoutInput,
+) -> LayoutOutput {
+    let id = usize::from(node_id);
+    let Some(cell_height) = inputs.known_dimensions.height else {
+        return compute_node_layout(doc, node_id, inputs);
+    };
+    let factor = cell_align_factor(&doc.nodes[id]);
+
+    // The natural (content) height at the same width. Measured first: Taffy's block `ComputeSize` also
+    // writes child positions, which the layout below must overwrite, not the other way round.
+    let natural = doc
+        .compute_child_layout(
+            node_id,
+            LayoutInput {
+                run_mode: RunMode::ComputeSize,
+                axis: RequestedAxis::Both,
+                known_dimensions: Size {
+                    width: inputs.known_dimensions.width,
+                    height: None,
+                },
+                ..inputs
+            },
+        )
+        .size
+        .height;
+
+    let output = compute_node_layout(doc, node_id, inputs);
+
+    let mut offset = (cell_height - natural).max(0.0) * factor;
+    // Float noise in `natural == cell_height` must not move a cell.
+    if offset < 0.001 {
+        offset = 0.0;
+    }
+    doc.nodes[id].table_cell_offset = offset;
+    if offset > 0.0 {
+        let children = doc.nodes[id].layout_children.borrow().clone();
+        for child_id in children.into_iter().flatten() {
+            let child = &mut doc.nodes[child_id];
+            // Out-of-flow boxes are placed relative to their containing block, not to the content.
+            if child.style.position != Position::Absolute {
+                child.unrounded_layout.location.y += offset;
+            }
+        }
+    }
+    output
+}
+
 pub struct RangeIter(Range<usize>);
 
 impl Iterator for RangeIter {
@@ -310,8 +403,20 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_> {
     }
 
     fn set_unrounded_layout(&mut self, node_id: taffy::NodeId, layout: &taffy::Layout) {
-        let node_id = taffy::NodeId::from(self.ctx.items[usize::from(node_id)].node_id);
-        self.doc.set_unrounded_layout(node_id, layout)
+        let item = &self.ctx.items[usize::from(node_id)];
+        let node_id = taffy::NodeId::from(item.node_id);
+        let offset = match item.kind {
+            TableItemKind::Cell => self.doc.nodes[item.node_id].table_cell_offset,
+            TableItemKind::Row => 0.0,
+        };
+        if offset > 0.0 {
+            // Inline content of the cell is placed from its top padding edge: move that edge down.
+            let mut layout = *layout;
+            layout.padding.top += offset;
+            self.doc.set_unrounded_layout(node_id, &layout)
+        } else {
+            self.doc.set_unrounded_layout(node_id, layout)
+        }
     }
 
     fn compute_child_layout(

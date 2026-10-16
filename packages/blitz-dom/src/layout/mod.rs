@@ -100,7 +100,16 @@ impl LayoutPartialTree for BaseDocument {
         inputs: taffy::tree::LayoutInput,
     ) -> taffy::tree::LayoutOutput {
         compute_cached_layout(self, node_id, inputs, |tree, node_id, inputs| {
-            compute_node_layout(tree, node_id, inputs)
+            // Inside the cached closure so that a cache hit does not move a cell's content twice.
+            if table::is_aligned_table_cell(tree, node_id, &inputs) {
+                table::compute_table_cell_layout(tree, node_id, inputs)
+            } else {
+                if inputs.run_mode == taffy::RunMode::PerformLayout {
+                    // A cell that is no longer aligned (or no longer stretched) must not keep an old offset.
+                    tree.nodes[usize::from(node_id)].table_cell_offset = 0.0;
+                }
+                compute_node_layout(tree, node_id, inputs)
+            }
         })
     }
 }
