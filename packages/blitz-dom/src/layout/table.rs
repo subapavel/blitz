@@ -5,8 +5,8 @@ use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{Atom, computed_values::table_layout::T as TableLayout};
 use taffy::{
-    Dimension, LayoutInput, LayoutOutput, LayoutPartialTree as _, NodeId, Position, RequestedAxis,
-    ResolveOrZero, RunMode, Size, TrackSizingFunction, compute_leaf_layout, style_helpers,
+    Dimension, LayoutInput, LayoutOutput, LayoutPartialTree as _, NodeId, Position, ResolveOrZero,
+    RunMode, Size, TrackSizingFunction, compute_leaf_layout, style_helpers,
 };
 
 use crate::BaseDocument;
@@ -303,6 +303,10 @@ pub(crate) fn is_aligned_table_cell(
 /// as in CSS Tables 3 §3 "intrinsic padding". The offset is stored in `Node::table_cell_offset`;
 /// [`TableTreeWrapper::set_unrounded_layout`] adds it to the top padding of the cell's layout, which is
 /// where inline content (laid out as one paragraph, no child boxes) is placed from.
+///
+/// The content is laid out at its natural height, as if the cell had `height: auto` (and no
+/// `height` or `min-height`, which only set the row's minimum), so a percentage height inside the cell is `auto` as
+/// in Chrome and never fills the stretched cell. The reported size is then the row's height.
 pub(crate) fn compute_table_cell_layout(
     doc: &mut BaseDocument,
     node_id: NodeId,
@@ -314,25 +318,33 @@ pub(crate) fn compute_table_cell_layout(
     };
     let factor = cell_align_factor(&doc.nodes[id]);
 
-    // The natural (content) height at the same width. Measured first: Taffy's block `ComputeSize` also
-    // writes child positions, which the layout below must overwrite, not the other way round.
-    let natural = doc
-        .compute_child_layout(
-            node_id,
-            LayoutInput {
-                run_mode: RunMode::ComputeSize,
-                axis: RequestedAxis::Both,
-                known_dimensions: Size {
-                    width: inputs.known_dimensions.width,
-                    height: None,
-                },
-                ..inputs
-            },
+    // `height` and `min-height` of the cell made it as tall as its row (`collect_table_cells` hands them
+    // to the grid as a minimum); they are not part of its content height.
+    let (height, min_height) = {
+        let style = &mut doc.nodes[id].style;
+        (
+            std::mem::replace(&mut style.size.height, style_helpers::auto()),
+            std::mem::replace(&mut style.min_size.height, style_helpers::auto()),
         )
-        .size
-        .height;
-
-    let output = compute_node_layout(doc, node_id, inputs);
+    };
+    let mut output = compute_node_layout(
+        doc,
+        node_id,
+        LayoutInput {
+            known_dimensions: Size {
+                width: inputs.known_dimensions.width,
+                height: None,
+            },
+            ..inputs
+        },
+    );
+    {
+        let style = &mut doc.nodes[id].style;
+        style.size.height = height;
+        style.min_size.height = min_height;
+    }
+    let natural = output.size.height;
+    output.size.height = cell_height;
 
     let mut offset = (cell_height - natural).max(0.0) * factor;
     // Float noise in `natural == cell_height` must not move a cell.
