@@ -7,6 +7,30 @@ use taffy::{
 use super::resolve_calc_value;
 use crate::BaseDocument;
 
+/// Breaks `layout` into lines no wider than `width`: [`parley::Layout::break_all_lines`] without the
+/// empty line Parley 0.6 adds after an inline box that overflows the line and ends the paragraph.
+///
+/// A box that does not fit at the start of a line is committed on that line anyway ("consume it and
+/// accept the overflow", CSS 2.1 §9.4.2: an unbreakable inline box wider than the line box overflows
+/// it). Parley's `greedy.rs` then takes one more `break_next` step, which finds no items left and
+/// commits an empty line with the previous line's metrics. That line has no content, but it doubles the
+/// paragraph's height, and a paragraph of two lines is fragmented differently from one of one line. It
+/// is recognised here as a final line of zero advance directly after an overflowing one, and taken back
+/// with [`parley::BreakLines::revert`]; a real trailing empty line (after a preserved newline) follows a
+/// line holding the newline, which does not overflow.
+fn break_lines(layout: &mut parley::Layout<crate::node::TextBrush>, width: f32) {
+    let mut breaker = layout.break_lines();
+    let mut previous_overflowed = false;
+    while let Some((advance, _)) = breaker.break_next(width) {
+        if breaker.is_done() && advance == 0.0 && previous_overflowed {
+            breaker.revert();
+            break;
+        }
+        previous_overflowed = advance > width;
+    }
+    breaker.finish();
+}
+
 impl BaseDocument {
     pub(crate) fn compute_inline_layout(
         &mut self,
@@ -122,7 +146,7 @@ impl BaseDocument {
                     //
                     // FIXME: avoid the need to clone the layout each time
                     let mut layout = inline_layout.clone();
-                    layout.layout.break_all_lines(Some(width));
+                    break_lines(&mut layout.layout, width);
 
                     return taffy::Size {
                         width: width.ceil() / scale,
@@ -131,7 +155,7 @@ impl BaseDocument {
                 }
 
                 // Perform inline layout
-                inline_layout.layout.break_all_lines(Some(width));
+                break_lines(&mut inline_layout.layout, width);
 
                 let alignment = self.nodes[node_id]
                     .primary_styles()
