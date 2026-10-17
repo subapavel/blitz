@@ -799,6 +799,11 @@ pub(crate) fn build_inline_layout_into(
     // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
     AT_WORD_START.with(|w| w.set(true));
 
+    // `text-wrap-mode` of the root applies to the whole context (Parley cannot switch it per span).
+    text_layout.nowrap = root_node_style
+        .as_ref()
+        .is_some_and(|s| stylo_to_parley::text_wrap_nowrap(s));
+
     // Set whitespace collapsing mode
     let collapse_mode = root_node_style
         .map(|s| s.get_inherited_text().white_space_collapse)
@@ -923,13 +928,7 @@ pub(crate) fn build_inline_layout_into(
                         } else if *tag_name == local_name!("br") {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             // TODO: update span id for br spans
-                            builder.push_style_modification_span(&[]);
-                            builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
-                            builder.push_text("\n");
-                            // A forced line break ends the word for `text-transform: capitalize`.
-                            AT_WORD_START.with(|w| w.set(true));
-                            builder.pop_style_span();
-                            builder.set_white_space_mode(collapse_mode);
+                            push_forced_break(builder, collapse_mode);
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let mut style = node
@@ -1005,12 +1004,31 @@ pub(crate) fn build_inline_layout_into(
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 // dbg!(&data.content);
                 // Text nodes have no style of their own: `text-transform` comes from the parent element.
-                let case = node
+                let parent_style = node
                     .parent
-                    .and_then(|parent| nodes[parent].primary_styles())
+                    .and_then(|parent| nodes[parent].primary_styles());
+                let case = parent_style
+                    .as_ref()
                     .map(|style| style.clone_text_transform().case());
                 let text = transform_text(&data.content, case);
-                builder.push_text(&text);
+                // `white-space: pre-line` collapses spaces and tabs but keeps segment breaks. Parley has only
+                // the two modes, so the text is split at its newlines: the pieces are collapsed and each
+                // newline is pushed as a preserved one, like a `<br>`. Parley's collapse then drops the
+                // indentation that follows a newline (it trims the start of text after whitespace).
+                let preserve_breaks = parent_style.as_ref().is_some_and(|style| {
+                    style.get_inherited_text().white_space_collapse
+                        == stylo_to_parley::stylo::WhiteSpaceCollapse::PreserveBreaks
+                });
+                if preserve_breaks && text.contains('\n') {
+                    for (index, piece) in text.split('\n').enumerate() {
+                        if index > 0 {
+                            push_forced_break(builder, collapse_mode);
+                        }
+                        builder.push_text(piece);
+                    }
+                } else {
+                    builder.push_text(&text);
+                }
             }
             NodeData::Comment => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -1018,6 +1036,18 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document => unreachable!(),
         }
     }
+}
+
+/// Pushes a preserved newline: the text before it is committed with `collapse_mode`, the newline itself is
+/// preserved, and `collapse_mode` is active again afterwards.
+fn push_forced_break(builder: &mut TreeBuilder<TextBrush>, collapse_mode: WhiteSpaceCollapse) {
+    builder.push_style_modification_span(&[]);
+    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
+    builder.push_text("\n");
+    // A forced line break ends the word for `text-transform: capitalize`.
+    AT_WORD_START.with(|w| w.set(true));
+    builder.pop_style_span();
+    builder.set_white_space_mode(collapse_mode);
 }
 
 /// The combining diacritical mark blocks (enough for decomposed Latin, Greek and Cyrillic text).

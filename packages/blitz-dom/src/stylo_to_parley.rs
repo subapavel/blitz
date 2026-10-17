@@ -7,6 +7,7 @@ use crate::node::TextBrush;
 
 // Module of type aliases so we can refer to stylo types with nicer names
 pub(crate) mod stylo {
+    pub(crate) use style::computed_values::text_wrap_mode::T as TextWrapMode;
     pub(crate) use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
     pub(crate) use style::properties::ComputedValues;
     pub(crate) use style::values::computed::OverflowWrap;
@@ -96,10 +97,18 @@ pub(crate) fn white_space_collapse(input: stylo::WhiteSpaceCollapse) -> parley::
         stylo::WhiteSpaceCollapse::Collapse => parley::WhiteSpaceCollapse::Collapse,
         stylo::WhiteSpaceCollapse::Preserve => parley::WhiteSpaceCollapse::Preserve,
 
-        // TODO: Implement PreserveBreaks and BreakSpaces modes
-        stylo::WhiteSpaceCollapse::PreserveBreaks => parley::WhiteSpaceCollapse::Preserve,
+        // `pre-line` collapses spaces and keeps segment breaks. Parley has no such mode: the text is collapsed
+        // and `build_inline_layout_recursive` pushes the newlines as preserved ones.
+        stylo::WhiteSpaceCollapse::PreserveBreaks => parley::WhiteSpaceCollapse::Collapse,
+        // TODO: `break-spaces` also wraps after preserved spaces.
         stylo::WhiteSpaceCollapse::BreakSpaces => parley::WhiteSpaceCollapse::Preserve,
     }
+}
+
+/// Whether `text-wrap-mode` is `nowrap`: soft wrap opportunities are not taken (the `white-space` shorthand
+/// sets it for `nowrap` and `pre`). Parley has no such property, see [`crate::node::TextLayout::nowrap`].
+pub(crate) fn text_wrap_nowrap(input: &stylo::ComputedValues) -> bool {
+    input.get_inherited_text().text_wrap_mode == stylo::TextWrapMode::Nowrap
 }
 
 pub(crate) fn style(

@@ -550,6 +550,12 @@ th {
     text-align: -moz-center-or-inherit;
 }
 
+/* HTML Standard 15.3.8: the `nowrap` attribute of a cell */
+td[nowrap],
+th[nowrap] {
+    white-space: nowrap;
+}
+
 :is(tr, tbody, thead, tfoot, table)>form:-moz-is-html {
     /* Important: don't show these forms in HTML */
     display: none !important;

@@ -18,7 +18,12 @@ use crate::BaseDocument;
 /// is recognised here as a final line of zero advance directly after an overflowing one, and taken back
 /// with [`parley::BreakLines::revert`]; a real trailing empty line (after a preserved newline) follows a
 /// line holding the newline, which does not overflow.
-fn break_lines(layout: &mut parley::Layout<crate::node::TextBrush>, width: f32) {
+///
+/// With `nowrap` (`text-wrap-mode: nowrap`) the lines are broken at an unbounded width, as Parley's own
+/// `break_all_lines(None)` does: only forced breaks (`<br>`, a preserved newline) end a line, and a line wider
+/// than `width` overflows it (CSS Text 3 §3, §7.1). The line is still aligned against the box, see the caller.
+fn break_lines(layout: &mut parley::Layout<crate::node::TextBrush>, width: f32, nowrap: bool) {
+    let width = if nowrap { f32::MAX } else { width };
     let mut breaker = layout.break_lines();
     let mut previous_overflowed = false;
     while let Some((advance, _)) = breaker.break_next(width) {
@@ -103,7 +108,12 @@ impl BaseDocument {
                         // This is a little tricky as the size of the inline boxes may depend on whether we are sizing under
                         // and a min-content or max-content constraint. So if we want to compute both widths in one pass then
                         // we need to store both a min-content and max-content size on each box.
-                        let content_sizes = inline_layout.layout.calculate_content_widths();
+                        let mut content_sizes = inline_layout.layout.calculate_content_widths();
+                        if inline_layout.nowrap {
+                            // No soft wrap opportunity: the context cannot be narrower than its widest line
+                            // (CSS Sizing 3 §5).
+                            content_sizes.min = content_sizes.max;
+                        }
                         let computed_width = match available_space.width {
                             AvailableSpace::MinContent => content_sizes.min,
                             AvailableSpace::MaxContent => content_sizes.max,
@@ -146,7 +156,7 @@ impl BaseDocument {
                     //
                     // FIXME: avoid the need to clone the layout each time
                     let mut layout = inline_layout.clone();
-                    break_lines(&mut layout.layout, width);
+                    break_lines(&mut layout.layout, width, layout.nowrap);
 
                     return taffy::Size {
                         width: width.ceil() / scale,
@@ -155,7 +165,7 @@ impl BaseDocument {
                 }
 
                 // Perform inline layout
-                break_lines(&mut inline_layout.layout, width);
+                break_lines(&mut inline_layout.layout, width, inline_layout.nowrap);
 
                 let alignment = self.nodes[node_id]
                     .primary_styles()

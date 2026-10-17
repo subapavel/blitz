@@ -542,6 +542,10 @@ pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+    /// The inline formatting context's root has `text-wrap-mode: nowrap` (`white-space: nowrap` or `pre`):
+    /// lines break only at forced breaks. Parley 0.6 has no wrap-mode style, so layout breaks the lines at
+    /// an unbounded width instead and reports the max-content width as the min-content width.
+    pub nowrap: bool,
 }
 
 impl TextLayout {
@@ -550,9 +554,14 @@ impl TextLayout {
     }
 
     pub fn content_widths(&mut self) -> ContentWidths {
-        *self
-            .content_widths
-            .get_or_insert_with(|| self.layout.calculate_content_widths())
+        let nowrap = self.nowrap;
+        *self.content_widths.get_or_insert_with(|| {
+            let mut widths = self.layout.calculate_content_widths();
+            if nowrap {
+                widths.min = widths.max;
+            }
+            widths
+        })
     }
 }
 
