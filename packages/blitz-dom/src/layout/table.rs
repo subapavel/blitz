@@ -26,6 +26,17 @@ pub struct TableTreeWrapper<'doc> {
 pub struct TableContext {
     style: taffy::Style<Atom>,
     items: Vec<TableItem>,
+    /// The columns of an automatic layout that have an explicit length `width`: they are never narrower than their
+    /// cells' min-content widths, see [`widen_explicit_columns`].
+    explicit_columns: Vec<ExplicitColumn>,
+}
+
+/// A grid track with a length width (`push_cell_item`) and the items of the cells that start in it and span only it.
+#[derive(Debug, Clone)]
+struct ExplicitColumn {
+    track: usize,
+    width: f32,
+    items: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -87,7 +98,8 @@ pub(crate) fn build_table_context(
 
     // The tracks are the columns of the table and each cell is placed on the ones it spans, now that every row
     // is known (see `track_columns`).
-    let tracks = track_columns(&placements, uses_fixed_algorithm(is_fixed, &style));
+    let fixed = uses_fixed_algorithm(is_fixed, &style);
+    let tracks = track_columns(&placements, fixed);
     for placement in &placements {
         let (start, span) = grid_column(&tracks, placement.start, placement.span);
         items[placement.item].style.grid_column = taffy::Line {
@@ -107,6 +119,30 @@ pub(crate) fn build_table_context(
         .collect();
     style.grid_template_rows = vec![style_helpers::auto(); row as usize];
 
+    // In automatic layout an explicit length is the column's preferred width, not a cap: see
+    // `widen_explicit_columns`.
+    let mut explicit_columns: Vec<ExplicitColumn> = Vec::new();
+    if !fixed {
+        for (track, column) in tracks.iter().enumerate() {
+            let Some(width) = columns.get(column) else {
+                continue;
+            };
+            if width.tag() != taffy::CompactLength::LENGTH_TAG {
+                continue;
+            }
+            let items = placements
+                .iter()
+                .filter(|p| grid_column(&tracks, p.start, p.span) == (track as i16 + 1, 1))
+                .map(|p| p.item)
+                .collect();
+            explicit_columns.push(ExplicitColumn {
+                track,
+                width: width.value(),
+                items,
+            });
+        }
+    }
+
     let layout_children = items
         .iter()
         .filter(|item| item.kind == TableItemKind::Cell)
@@ -115,7 +151,73 @@ pub(crate) fn build_table_context(
     let root_node = &mut doc.nodes[table_root_node_id];
     root_node.children = children;
 
-    (TableContext { style, items }, layout_children)
+    (
+        TableContext {
+            style,
+            items,
+            explicit_columns,
+        },
+        layout_children,
+    )
+}
+
+/// A column of an automatic table layout is never narrower than the largest min-content width of its cells (CSS 2.1
+/// §17.5.2.2), so an explicit cell `width` is the column's preferred width and not a cap: a `nowrap` price in a
+/// `width: 50px` cell widens its column instead of spilling into the next cell. The grid takes the explicit length as
+/// a fixed track, so the tracks that have one are measured first (the cells' own `width` is ignored while measuring, see
+/// `TableTreeWrapper::compute_child_layout`) and replaced by a wider fixed track where a cell needs it. The fixed
+/// algorithm (§17.5.2.1) has no such columns: its content overflows.
+///
+/// Returns the context to lay the table out with: `context` itself when no column needs widening.
+pub(crate) fn widen_explicit_columns(
+    doc: &mut BaseDocument,
+    context: Arc<TableContext>,
+) -> Arc<TableContext> {
+    if context.explicit_columns.is_empty() {
+        return context;
+    }
+    let mut widened = Vec::new();
+    {
+        let mut wrapper = TableTreeWrapper {
+            doc,
+            ctx: Arc::clone(&context),
+        };
+        for column in &context.explicit_columns {
+            let mut width = column.width;
+            for &item in &column.items {
+                let output = taffy::LayoutPartialTree::compute_child_layout(
+                    &mut wrapper,
+                    NodeId::from(item),
+                    LayoutInput {
+                        run_mode: RunMode::ComputeSize,
+                        sizing_mode: taffy::SizingMode::InherentSize,
+                        axis: taffy::RequestedAxis::Horizontal,
+                        known_dimensions: Size::NONE,
+                        parent_size: Size::NONE,
+                        available_space: Size {
+                            width: taffy::AvailableSpace::MinContent,
+                            height: taffy::AvailableSpace::MaxContent,
+                        },
+                        vertical_margins_are_collapsible: taffy::Line::FALSE,
+                    },
+                );
+                width = width.max(output.size.width);
+            }
+            if width > column.width {
+                widened.push((column.track, width));
+            }
+        }
+    }
+    if widened.is_empty() {
+        return context;
+    }
+    let mut context = (*context).clone();
+    for (track, width) in widened {
+        context.style.grid_template_columns[track] =
+            TrackSizingFunction::from(style_helpers::length::<f32, Dimension>(width)).into();
+    }
+    #[allow(clippy::arc_with_non_send_sync)]
+    Arc::new(context)
 }
 
 /// The border-box width of a cell with an explicit length `width`, which is what its column track needs.
@@ -815,8 +917,26 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_> {
                 })
             }
             TableItemKind::Cell => {
-                let node_id = taffy::NodeId::from(cell.node_id);
-                self.doc.compute_child_layout(node_id, inputs)
+                let id = cell.node_id;
+                // The cell's explicit length `width` is the column's business (`push_cell_item` gave it to the
+                // track). Left on the cell it would also be the cell's min-content size, so a `nowrap` text in a
+                // `width: 50px` cell could not widen its column and would spill into the next cell. (Percentages
+                // are left alone: they resolve against the table, not to a length of their own.)
+                let length_width =
+                    self.doc.nodes[id].style.size.width.tag() == taffy::CompactLength::LENGTH_TAG;
+                let width = length_width.then(|| {
+                    std::mem::replace(
+                        &mut self.doc.nodes[id].style.size.width,
+                        style_helpers::auto(),
+                    )
+                });
+                let output = self
+                    .doc
+                    .compute_child_layout(taffy::NodeId::from(id), inputs);
+                if let Some(width) = width {
+                    self.doc.nodes[id].style.size.width = width;
+                }
+                output
             }
         }
     }
