@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use markup5ever::local_name;
 use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
@@ -72,21 +72,38 @@ pub(crate) fn build_table_context(
         row: 0,
         col: 0,
         items: Vec::new(),
-        columns: Vec::new(),
+        columns: BTreeMap::new(),
+        first_row_width: 0,
+        placements: Vec::new(),
     };
     collect_table_children(doc, table_root_node_id, &children, Level::Table, &mut grid);
     let GridBuilder {
         row,
-        col,
-        items,
-        columns: mut column_sizes,
+        mut items,
+        columns,
+        placements,
         ..
     } = grid;
-    column_sizes.resize(col as usize, style_helpers::auto());
 
-    style.grid_template_columns = column_sizes
-        .into_iter()
-        .map(|dim| TrackSizingFunction::from(dim).into())
+    // The tracks are the columns of the table and each cell is placed on the ones it spans, now that every row
+    // is known (see `track_columns`).
+    let tracks = track_columns(&placements, uses_fixed_algorithm(is_fixed, &style));
+    for placement in &placements {
+        let (start, span) = grid_column(&tracks, placement.start, placement.span);
+        items[placement.item].style.grid_column = taffy::Line {
+            start: style_helpers::line(start),
+            end: style_helpers::span(span),
+        };
+    }
+    style.grid_template_columns = tracks
+        .iter()
+        .map(|column| {
+            let width = columns
+                .get(column)
+                .copied()
+                .unwrap_or_else(style_helpers::auto);
+            TrackSizingFunction::from(width).into()
+        })
         .collect();
     style.grid_template_rows = vec![style_helpers::auto(); row as usize];
 
@@ -164,40 +181,36 @@ pub(crate) fn grid_container_min_height(style: &mut taffy::Style<Atom>) {
 }
 
 /// The largest `colspan` HTML allows (HTML §4.9.11: a value above 1000 is clamped to 1000).
-const MAX_COLSPAN: u16 = 1000;
+const MAX_COLSPAN: u32 = 1000;
 
-/// Taffy grid lines are `i16`, and a placement past them panics. A row's cells are placed in at most this many
-/// columns; once a row reaches it, its remaining cells share the last column (laid out and painted, overlapping)
-/// instead of failing the whole document. Far beyond any real table (Chrome caps a span at 1000 as well).
-const MAX_COLUMNS: u16 = 16_384;
+/// Taffy grid lines are `i16`, and a placement past them panics. A table has at most this many column tracks;
+/// cells that start past the last one share it (laid out and painted, overlapping) instead of failing the whole
+/// document. Far beyond any real table (Chrome caps a span at 1000 as well).
+const MAX_COLUMNS: u32 = 16_384;
 
 /// A `colspan` attribute by HTML's rules for parsing non-negative integers (HTML §2.3.4.2): leading ASCII
 /// whitespace and one `+` skipped, then the leading digits (`"2.5"` and `"2px"` are 2). A missing, unparsable or
 /// zero value is 1; a value above [`MAX_COLSPAN`] is [`MAX_COLSPAN`] (HTML §4.9.11). Chrome agrees on every case.
-fn parse_colspan(value: Option<&str>) -> u16 {
+fn parse_colspan(value: Option<&str>) -> u32 {
     let Some(value) = value else { return 1 };
     let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
     let value = value.strip_prefix('+').unwrap_or(value);
     let mut span: u32 = 0;
     for digit in value.bytes().take_while(u8::is_ascii_digit) {
         // Saturate early: only "above the maximum" matters, not the exact value.
-        span = (span * 10 + u32::from(digit - b'0')).min(u32::from(MAX_COLSPAN) + 1);
+        span = (span * 10 + u32::from(digit - b'0')).min(MAX_COLSPAN + 1);
     }
-    if span == 0 {
-        1
-    } else {
-        span.min(u32::from(MAX_COLSPAN)) as u16
-    }
+    if span == 0 { 1 } else { span.min(MAX_COLSPAN) }
 }
 
 /// Adds the table cell `node_id` (a `display: table-cell` element, or an anonymous cell) to the grid: its column
-/// track from the first row's widths (or a wider `width` below it), its grid position, and its style as a grid item.
+/// width from the first row (or a wider `width` below it), its style as a grid item and its [`CellPlacement`]. Its
+/// grid position is set by [`build_table_context`] once every row is known.
 fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
     let node = &doc.nodes[node_id];
     let stylo_style = &node.primary_styles().unwrap();
-    // Past `MAX_COLUMNS` a cell goes into the last column (see there); its span never reaches past it.
-    grid.col = grid.col.min(MAX_COLUMNS - 1);
-    let colspan = parse_colspan(node.attr(local_name!("colspan"))).min(MAX_COLUMNS - grid.col);
+    let start = grid.col;
+    let colspan = parse_colspan(node.attr(local_name!("colspan")));
     let mut style = stylo_taffy::to_taffy_style(stylo_style);
 
     // TODO: account for padding/border/margin
@@ -219,39 +232,95 @@ fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
                 _ => unreachable!(),
             }
         };
-        grid.columns.push(column);
+        grid.columns.insert(start, column);
+        grid.first_row_width = start.saturating_add(colspan);
     } else if !grid.is_fixed
-        && (grid.col as usize) < grid.columns.len()
+        && start < grid.first_row_width
         && taffy::CompactLength::LENGTH_TAG == style.size.width.tag()
     {
         let new_len = cell_border_box_width(&style);
-        let tag = grid.columns[grid.col as usize].tag();
-        let value = grid.columns[grid.col as usize].value();
-        grid.columns[grid.col as usize] = match tag {
-            taffy::CompactLength::LENGTH_TAG => style_helpers::length(value.max(new_len)),
+        let column = grid
+            .columns
+            .entry(start)
+            .or_insert_with(style_helpers::auto);
+        *column = match column.tag() {
+            taffy::CompactLength::LENGTH_TAG => style_helpers::length(column.value().max(new_len)),
             taffy::CompactLength::AUTO_TAG => style_helpers::length(new_len),
-            taffy::CompactLength::PERCENT_TAG => style_helpers::percent(value),
+            taffy::CompactLength::PERCENT_TAG => style_helpers::percent(column.value()),
             _ => unreachable!(),
-        }
+        };
     }
 
-    style.grid_column = taffy::Line {
-        start: style_helpers::line((grid.col + 1) as i16),
-        end: style_helpers::span(colspan),
-    };
     style.grid_row = taffy::Line {
         start: style_helpers::line(grid.row as i16),
         end: style_helpers::span(1),
     };
     style.size.width = style_helpers::auto();
     height_as_table_minimum(&mut style);
+    grid.placements.push(CellPlacement {
+        item: grid.items.len(),
+        start,
+        span: colspan,
+    });
     grid.items.push(TableItem {
         kind: TableItemKind::Cell,
         node_id,
         style,
     });
 
-    grid.col += colspan;
+    grid.col = start.saturating_add(colspan);
+}
+
+/// Where a cell starts and how far it reaches, in the raw columns its row gives it (the sum of the `colspan`s before
+/// it, and its own); `item` indexes the cell's [`TableItem`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CellPlacement {
+    item: usize,
+    start: u32,
+    span: u32,
+}
+
+/// Whether the table's columns are laid out by the fixed table algorithm (CSS 2.1 §17.5.2.1: every column the widest
+/// row has is a column of the table, whatever its content). CSS Tables 3 applies it only when `table-layout` is
+/// `fixed` *and* the table's `width` is not `auto`; Chrome lays out `table-layout: fixed; width: auto` automatically.
+fn uses_fixed_algorithm(is_fixed: bool, style: &taffy::Style<Atom>) -> bool {
+    let width = style.size.width;
+    let auto = !width.into_raw().is_calc() && width.tag() == taffy::CompactLength::AUTO_TAG;
+    is_fixed && !auto
+}
+
+/// The raw columns that are column tracks of the grid, ascending. In automatic layout a column in which no cell
+/// starts has no width (Chrome; HTML calls it a table model error and renders nothing for it), so the tracks are the
+/// columns some cell starts in: a `colspan` wider than the table creates none. In fixed layout every column up to
+/// the widest row is a track (CSS 2.1 §17.5.2.1: "any remaining columns equally divide the remaining horizontal
+/// table space"). At most [`MAX_COLUMNS`].
+fn track_columns(placements: &[CellPlacement], fixed: bool) -> Vec<u32> {
+    if fixed {
+        let widest = placements
+            .iter()
+            .map(|p| p.start.saturating_add(p.span))
+            .max()
+            .unwrap_or(0);
+        return (0..widest.min(MAX_COLUMNS)).collect();
+    }
+    let mut columns: Vec<u32> = placements.iter().map(|p| p.start).collect();
+    columns.sort_unstable();
+    columns.dedup();
+    columns.truncate(MAX_COLUMNS as usize);
+    columns
+}
+
+/// The grid placement of a cell that starts in raw column `start` and spans `span` raw columns: its 1-based start
+/// line and the number of tracks it covers (the tracks whose columns lie in `[start, start + span)`, at least one).
+/// A cell that starts past the last track (only when there are more than [`MAX_COLUMNS`] of them) sits on the last
+/// one. `tracks` must not be empty.
+fn grid_column(tracks: &[u32], start: u32, span: u32) -> (i16, u16) {
+    let first = tracks.partition_point(|&column| column < start);
+    if first >= tracks.len() {
+        return (tracks.len() as i16, 1);
+    }
+    let end = tracks.partition_point(|&column| column < start.saturating_add(span));
+    ((first + 1) as i16, (end - first).max(1) as u16)
 }
 
 /// What a child of a table, a row group or a row is, by its computed `display` and not its tag (css-display-3 §2.4:
@@ -422,9 +491,14 @@ pub(crate) fn plan_table_children(level: Level, parts: &[TablePart]) -> Vec<Slot
 struct GridBuilder {
     is_fixed: bool,
     row: u16,
-    col: u16,
+    /// The raw column the next cell of the row starts in.
+    col: u32,
     items: Vec<TableItem>,
-    columns: Vec<Dimension>,
+    /// The width of the column each first-row cell starts in (or a wider one below it), by raw column.
+    columns: BTreeMap<u32, Dimension>,
+    /// The raw columns of the first row; a later row's cell widens a column only if it starts within them.
+    first_row_width: u32,
+    placements: Vec<CellPlacement>,
 }
 
 /// Hidden boxes, columns and captions are not constructed: they have no box in the table.
@@ -882,6 +956,144 @@ mod tests {
             grid_container_min_height(&mut style);
             assert_eq!(style.min_size.height, min);
         }
+    }
+
+    /// Placements of rows given as the `colspan`s of their cells.
+    fn placed(rows: &[&[u32]]) -> Vec<CellPlacement> {
+        let mut out = Vec::new();
+        for spans in rows {
+            let mut start = 0;
+            for &span in *spans {
+                out.push(CellPlacement {
+                    item: out.len(),
+                    start,
+                    span,
+                });
+                start += span;
+            }
+        }
+        out
+    }
+
+    /// The `(line, span)` of every cell, by [`grid_column`] over the tracks of `rows`.
+    fn grid_of(rows: &[&[u32]], fixed: bool) -> (Vec<u32>, Vec<(i16, u16)>) {
+        let placements = placed(rows);
+        let tracks = track_columns(&placements, fixed);
+        let cells = placements
+            .iter()
+            .map(|p| grid_column(&tracks, p.start, p.span))
+            .collect();
+        (tracks, cells)
+    }
+
+    #[test]
+    fn a_span_past_the_end_of_the_table_covers_the_real_columns_only() {
+        // `A B C` over one cell spanning 99: the cell covers the three tracks, not 99.
+        let (tracks, cells) = grid_of(&[&[1, 1, 1], &[99]], false);
+        assert_eq!(tracks, [0, 1, 2]);
+        assert_eq!(cells, [(1, 1), (2, 1), (3, 1), (1, 3)]);
+        // Exact and far-too-wide spans are the same grid.
+        assert_eq!(grid_of(&[&[1, 1, 1], &[3]], false).1, cells);
+        assert_eq!(grid_of(&[&[1, 1, 1], &[1000]], false).1, cells);
+        // So is a spanning cell above the cells it spans.
+        let (_, above) = grid_of(&[&[99], &[1, 1, 1]], false);
+        assert_eq!(above, [(1, 3), (1, 1), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn a_column_only_spans_cover_is_not_a_track() {
+        // Every row is `X` over two columns, then `Y`: column 1 starts no cell.
+        let (tracks, cells) = grid_of(&[&[2, 1], &[2, 1]], false);
+        assert_eq!(tracks, [0, 2]);
+        assert_eq!(cells, [(1, 1), (2, 1), (1, 1), (2, 1)]);
+        // `A`, `B` over two columns, `D` / `X` over three, `Y`: the tracks are 0, 1 and 3.
+        let (tracks, cells) = grid_of(&[&[1, 2, 1], &[3, 1]], false);
+        assert_eq!(tracks, [0, 1, 3]);
+        assert_eq!(cells, [(1, 1), (2, 1), (3, 1), (1, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn a_spanning_first_row_leaves_the_tracks_to_the_rows_below() {
+        let (tracks, cells) = grid_of(&[&[2, 1], &[1, 1, 1]], false);
+        assert_eq!(tracks, [0, 1, 2]);
+        assert_eq!(cells, [(1, 2), (3, 1), (1, 1), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn rows_that_all_span_form_one_track() {
+        let (tracks, cells) = grid_of(&[&[5], &[3]], false);
+        assert_eq!(tracks, [0]);
+        assert_eq!(cells, [(1, 1), (1, 1)]);
+        let (tracks, cells) = grid_of(&[&[1000]], false);
+        assert_eq!(tracks, [0]);
+        assert_eq!(cells, [(1, 1)]);
+    }
+
+    #[test]
+    fn rows_of_spans_of_5_3_and_4_plus_1_have_two_tracks() {
+        let (tracks, cells) = grid_of(&[&[5], &[3], &[4, 1]], false);
+        assert_eq!(tracks, [0, 4]);
+        assert_eq!(cells, [(1, 2), (1, 1), (1, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn fixed_layout_keeps_every_column_up_to_the_widest_row() {
+        let (tracks, cells) = grid_of(&[&[1, 1, 1], &[99], &[1]], true);
+        assert_eq!(tracks.len(), 99);
+        assert_eq!(cells[0..3], [(1, 1), (2, 1), (3, 1)]);
+        assert_eq!(cells[3], (1, 99));
+        // The same table in automatic layout has three.
+        assert_eq!(grid_of(&[&[1, 1, 1], &[99], &[1]], false).0.len(), 3);
+        // A row ending in a cell after the span is placed after it.
+        let (tracks, cells) = grid_of(&[&[1, 1, 1], &[99, 1]], true);
+        assert_eq!(tracks.len(), 100);
+        assert_eq!(cells[4], (100, 1));
+    }
+
+    #[test]
+    fn twenty_cells_of_colspan_1000_are_twenty_tracks() {
+        let row = [1000; 20];
+        let (tracks, cells) = grid_of(&[&row, &row], false);
+        assert_eq!(tracks.len(), 20);
+        let lines: Vec<i16> = cells.iter().take(20).map(|c| c.0).collect();
+        assert_eq!(lines, (1..=20).collect::<Vec<i16>>());
+        assert!(cells.iter().all(|c| c.1 == 1));
+    }
+
+    #[test]
+    fn a_table_without_cells_has_no_tracks() {
+        assert!(track_columns(&[], false).is_empty());
+        assert!(track_columns(&[], true).is_empty());
+    }
+
+    #[test]
+    fn more_columns_than_grid_lines_share_the_last_track() {
+        let row = vec![1; MAX_COLUMNS as usize + 600];
+        for fixed in [false, true] {
+            let (tracks, cells) = grid_of(&[&row], fixed);
+            assert_eq!(tracks.len(), MAX_COLUMNS as usize, "fixed: {fixed}");
+            assert_eq!(cells[0], (1, 1));
+            assert_eq!(cells[MAX_COLUMNS as usize - 1], (MAX_COLUMNS as i16, 1));
+            // Past the last track: on it, never beyond Taffy's `i16` grid lines.
+            assert_eq!(cells[MAX_COLUMNS as usize + 500], (MAX_COLUMNS as i16, 1));
+        }
+        // A span reaching past the last track stops at it.
+        let tracks: Vec<u32> = (0..MAX_COLUMNS).collect();
+        assert_eq!(
+            grid_column(&tracks, MAX_COLUMNS - 3, MAX_COLSPAN),
+            (MAX_COLUMNS as i16 - 2, 3)
+        );
+    }
+
+    #[test]
+    fn the_fixed_algorithm_needs_a_table_width() {
+        let mut style = taffy::Style::<Atom>::default();
+        assert!(!uses_fixed_algorithm(true, &style));
+        style.size.width = length(600.0);
+        assert!(uses_fixed_algorithm(true, &style));
+        style.size.width = percent(1.0_f32);
+        assert!(uses_fixed_algorithm(true, &style));
+        assert!(!uses_fixed_algorithm(false, &style));
     }
 
     use TablePart::{Caption, Cell, Column, Hidden, Other, Row, RowGroup, Whitespace};
