@@ -350,7 +350,7 @@ fn compute_node_layout(
                     panic!("Node marked as table root but doesn't have TableContext");
                 };
                 let context = Arc::clone(context);
-                let context = table::widen_explicit_columns(tree, context);
+                let context = table::widen_explicit_columns(tree, context, &inputs);
 
                 let mut table_wrapper = TableTreeWrapper {
                     doc: tree,

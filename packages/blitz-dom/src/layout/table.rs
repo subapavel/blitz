@@ -31,12 +31,21 @@ pub struct TableContext {
     explicit_columns: Vec<ExplicitColumn>,
 }
 
-/// A grid track with a length width (`push_cell_item`) and the items of the cells that start in it and span only it.
+/// A grid track with an explicit length or percentage width (`push_cell_item`) and the items of the cells that start in
+/// it and span only it.
 #[derive(Debug, Clone)]
 struct ExplicitColumn {
     track: usize,
-    width: f32,
+    width: ColumnWidth,
     items: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ColumnWidth {
+    /// A border-box width in px.
+    Length(f32),
+    /// A fraction of the table's content-box width (`0.1` for `10%`).
+    Percent(f32),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -127,9 +136,11 @@ pub(crate) fn build_table_context(
             let Some(width) = columns.get(column) else {
                 continue;
             };
-            if width.tag() != taffy::CompactLength::LENGTH_TAG {
-                continue;
-            }
+            let width = match width.tag() {
+                taffy::CompactLength::LENGTH_TAG => ColumnWidth::Length(width.value()),
+                taffy::CompactLength::PERCENT_TAG => ColumnWidth::Percent(width.value()),
+                _ => continue,
+            };
             let items = placements
                 .iter()
                 .filter(|p| grid_column(&tracks, p.start, p.span) == (track as i16 + 1, 1))
@@ -137,7 +148,7 @@ pub(crate) fn build_table_context(
                 .collect();
             explicit_columns.push(ExplicitColumn {
                 track,
-                width: width.value(),
+                width,
                 items,
             });
         }
@@ -168,14 +179,21 @@ pub(crate) fn build_table_context(
 /// `TableTreeWrapper::compute_child_layout`) and replaced by a wider fixed track where a cell needs it. The fixed
 /// algorithm (§17.5.2.1) has no such columns: its content overflows.
 ///
+/// A percentage width is the same kind of preference: `10%` of the table's content width, when that is definite (with an
+/// indefinite one the grid takes the percentage as `auto` anyway), and never less than the min-content.
+///
+/// `inputs` are those of the table's own layout, which decide what a percentage is a percentage of.
+///
 /// Returns the context to lay the table out with: `context` itself when no column needs widening.
 pub(crate) fn widen_explicit_columns(
     doc: &mut BaseDocument,
     context: Arc<TableContext>,
+    inputs: &LayoutInput,
 ) -> Arc<TableContext> {
     if context.explicit_columns.is_empty() {
         return context;
     }
+    let basis = table_content_width(&context.style, inputs);
     let mut widened = Vec::new();
     {
         let mut wrapper = TableTreeWrapper {
@@ -183,7 +201,14 @@ pub(crate) fn widen_explicit_columns(
             ctx: Arc::clone(&context),
         };
         for column in &context.explicit_columns {
-            let mut width = column.width;
+            let preferred = match column.width {
+                ColumnWidth::Length(width) => width,
+                ColumnWidth::Percent(fraction) => match basis {
+                    Some(basis) => fraction * basis,
+                    None => continue,
+                },
+            };
+            let mut width = preferred;
             for &item in &column.items {
                 let output = taffy::LayoutPartialTree::compute_child_layout(
                     &mut wrapper,
@@ -203,7 +228,7 @@ pub(crate) fn widen_explicit_columns(
                 );
                 width = width.max(output.size.width);
             }
-            if width > column.width {
+            if width > preferred {
                 widened.push((column.track, width));
             }
         }
@@ -218,6 +243,40 @@ pub(crate) fn widen_explicit_columns(
     }
     #[allow(clippy::arc_with_non_send_sync)]
     Arc::new(context)
+}
+
+/// The width the grid resolves a percentage track against: the content box of the table, from the same inputs Taffy's
+/// grid layout uses (`known_dimensions`, else the preferred size when it is the inherent size, clamped by `min-width` /
+/// `max-width`), or `None` when it is not definite.
+fn table_content_width(style: &taffy::Style<Atom>, inputs: &LayoutInput) -> Option<f32> {
+    use taffy::{MaybeMath as _, MaybeResolve as _};
+    let parent = inputs.parent_size.width;
+    let padding_border = (style.padding.resolve_or_zero(parent, resolve_calc_value)
+        + style.border.resolve_or_zero(parent, resolve_calc_value))
+    .horizontal_components()
+    .sum();
+    let adjustment = if style.box_sizing == taffy::BoxSizing::ContentBox {
+        padding_border
+    } else {
+        0.0
+    };
+    let resolve = |dimension: Dimension| {
+        dimension
+            .maybe_resolve(parent, resolve_calc_value)
+            .map(|w| w + adjustment)
+    };
+    let preferred = if inputs.sizing_mode == taffy::SizingMode::InherentSize {
+        resolve(style.size.width)
+    } else {
+        None
+    };
+    let outer = inputs
+        .known_dimensions
+        .width
+        .or(preferred)
+        .maybe_clamp(resolve(style.min_size.width), resolve(style.max_size.width))
+        .maybe_max(padding_border);
+    outer.map(|outer| outer - padding_border)
 }
 
 /// The border-box width of a cell with an explicit length `width`, which is what its column track needs.
