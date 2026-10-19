@@ -83,11 +83,13 @@ impl SharedStyles {
         &self.inner.base_url
     }
 
-    pub(crate) fn ua_sheets(&self) -> &[(String, DocumentStyleSheet)] {
+    /// The user agent sheets, with the text each was parsed from.
+    pub fn ua_sheets(&self) -> &[(String, DocumentStyleSheet)] {
         &self.inner.ua
     }
 
-    pub(crate) fn author_sheets(&self) -> &[DocumentStyleSheet] {
+    /// The author sheets every document starts with, in cascade order.
+    pub fn author_sheets(&self) -> &[DocumentStyleSheet] {
         &self.inner.author
     }
 }
