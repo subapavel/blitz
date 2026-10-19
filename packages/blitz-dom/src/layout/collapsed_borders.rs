@@ -175,6 +175,11 @@ pub struct CollapsedBorders {
     pub tracks: u32,
     pub horizontal: Vec<BorderSpec>,
     pub vertical: Vec<BorderSpec>,
+    /// The kind of element each segment's border came from, laid out like `horizontal` and `vertical` (a segment
+    /// without a border says `Table`). A consumer that compares a segment with another border (a repeated header
+    /// copy, F22b) needs it for rule 5.
+    pub horizontal_origin: Vec<EdgeOrigin>,
+    pub vertical_origin: Vec<EdgeOrigin>,
     pub cells: Vec<CollapsedCell>,
 }
 
@@ -182,6 +187,16 @@ impl CollapsedBorders {
     /// The segment of horizontal line `line` (0..=rows) at track `track`.
     pub fn horizontal(&self, line: u32, track: u32) -> &BorderSpec {
         &self.horizontal[line as usize * self.tracks as usize + track as usize]
+    }
+
+    /// The kind of element the border of [`Self::horizontal`]`(line, track)` came from.
+    pub fn horizontal_origin(&self, line: u32, track: u32) -> EdgeOrigin {
+        self.horizontal_origin[line as usize * self.tracks as usize + track as usize]
+    }
+
+    /// The kind of element the border of [`Self::vertical`]`(row, line)` came from.
+    pub fn vertical_origin(&self, row: u32, line: u32) -> EdgeOrigin {
+        self.vertical_origin[row as usize * (self.tracks as usize + 1) + line as usize]
     }
 
     /// The segment of vertical line `line` (0..=tracks) in row `row`.
@@ -255,6 +270,8 @@ pub(crate) fn resolve(
         tracks,
         horizontal: Vec::new(),
         vertical: Vec::new(),
+        horizontal_origin: Vec::new(),
+        vertical_origin: Vec::new(),
         cells: cells
             .iter()
             .map(|c| CollapsedCell {
@@ -305,6 +322,7 @@ pub(crate) fn resolve(
         })
     };
     let spec_of = |best: Option<Candidate>| best.map_or(BorderSpec::NONE, |c| c.spec);
+    let origin_of = |best: Option<Candidate>| best.map_or(EdgeOrigin::Table, |c| c.origin);
 
     // Horizontal lines: line `i` is between row `i - 1` (above) and row `i` (below).
     out.horizontal.reserve((nr + 1) * nt);
@@ -354,6 +372,7 @@ pub(crate) fn resolve(
                 best = fold(best, candidate(table[BOTTOM], EdgeOrigin::Table, nr, 0));
             }
             out.horizontal.push(spec_of(best));
+            out.horizontal_origin.push(origin_of(best));
         }
     }
 
@@ -405,6 +424,7 @@ pub(crate) fn resolve(
                 best = fold(best, candidate(table[RIGHT], EdgeOrigin::Table, 0, nt));
             }
             out.vertical.push(spec_of(best));
+            out.vertical_origin.push(origin_of(best));
         }
     }
     out
