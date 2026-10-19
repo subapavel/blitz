@@ -34,7 +34,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, Bound, HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Context as TaskContext;
 use style::Atom;
@@ -65,7 +65,71 @@ use rayon::prelude::*;
 
 thread_local! {
     static LAYOUT_CTX: RefCell<Option<Box<LayoutContext<TextBrush>>>> = const { RefCell::new(None) };
-    static FONT_CTX: RefCell<Option<Box<FontContext>>> = const { RefCell::new(None) };
+    /// The font context a construction worker shapes with, together with the generation of the document it is
+    /// a snapshot of (see [`BaseDocument::font_generation`]). Never used for a document of another generation.
+    static FONT_CTX: RefCell<Option<(u64, Box<FontContext>)>> = const { RefCell::new(None) };
+}
+
+/// Source of [`BaseDocument::font_generation`]: process-wide, so that no two font contexts (of the same or of
+/// different documents) ever share a generation number.
+static FONT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_font_generation() -> u64 {
+    FONT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Deferred inline layouts below this number are shaped on the calling thread. Measured on a 4 vCPU VM, shaping one
+/// takes 10-30 us in table- and card-like documents and about 180 us in long paragraphs, so below a few hundred of
+/// them the whole stage is a few milliseconds and handing it to the pool (wake-up, one font-context snapshot per
+/// worker) gains nothing measurable: a `@page` margin box is 1-2 tasks, a one-page invoice 25-50, a 60-row,
+/// 3-page invoice 324; a 200-page document has 2500 to 25000. The count is a proxy: a handful of very long
+/// paragraphs stays serial.
+#[cfg(feature = "parallel-construct")]
+const PARALLEL_CONSTRUCT_MIN_TASKS: usize = 256;
+
+/// Take this thread's font context for a document of generation `generation`: the thread's own snapshot if it is
+/// one of that generation, else a fresh snapshot of the document's context. Whatever the thread held for another
+/// generation is dropped, so fonts and generic-family mappings of an earlier document cannot reach this one.
+#[cfg(feature = "parallel-construct")]
+fn take_worker_font_ctx(generation: u64, source: &Mutex<FontContext>) -> Box<FontContext> {
+    match FONT_CTX.take() {
+        Some((g, ctx)) if g == generation => ctx,
+        _ => Box::new(source.lock().unwrap().clone()),
+    }
+}
+
+/// Hand the font context back to this thread after a task, to be reused by the next task of the same generation.
+#[cfg(feature = "parallel-construct")]
+fn put_worker_font_ctx(generation: u64, ctx: Box<FontContext>) {
+    FONT_CTX.set(Some((generation, ctx)));
+}
+
+/// Build the inline layout of one deferred construction task.
+fn run_construction_task(
+    nodes: &Slab<Node>,
+    layout_ctx: &mut LayoutContext<TextBrush>,
+    font_ctx: &mut FontContext,
+    scale: f32,
+    task: ConstructionTask,
+) -> ConstructionTaskResult {
+    match task.data {
+        ConstructionTaskData::InlineLayout(mut layout) => {
+            layout.content_widths = None;
+            build_inline_layout_into(
+                nodes,
+                layout_ctx,
+                font_ctx,
+                &mut layout,
+                scale,
+                task.node_id,
+            );
+
+            ConstructionTaskResult {
+                node_id: task.node_id,
+                data: ConstructionTaskResultData::InlineLayout(layout),
+            }
+        }
+    }
 }
 
 #[cfg(feature = "incremental")]
@@ -127,6 +191,10 @@ pub struct BaseDocument {
     // Parley contexts
     /// A Parley font context
     pub(crate) font_ctx: Arc<Mutex<parley::FontContext>>,
+    /// Identifies the state of `font_ctx`: taken from a process-wide counter when the document is created and
+    /// again every time a font is registered. Construction workers keep a snapshot of the font context per
+    /// thread and reuse it only while this number is unchanged.
+    pub(crate) font_generation: u64,
     /// A Parley layout context
     pub(crate) layout_ctx: parley::LayoutContext<TextBrush>,
 
@@ -268,6 +336,7 @@ impl BaseDocument {
             ua_stylesheets: HashMap::new(),
             nodes_to_stylesheet: BTreeMap::new(),
             font_ctx,
+            font_generation: next_font_generation(),
             layout_ctx: parley::LayoutContext::new(),
 
             hover_node_id: None,
@@ -724,26 +793,8 @@ impl BaseDocument {
                 let mut font_ctx = self.font_ctx.lock().unwrap();
                 font_ctx.collection.register_fonts(font.clone(), None);
 
-                #[cfg(feature = "parallel-construct")]
-                {
-                    let doc_font_ctx = &*font_ctx;
-                    rayon::broadcast(|_ctx| {
-                        FONT_CTX.with_borrow_mut(|font_ctx| {
-                            match font_ctx {
-                                None => {
-                                    println!(
-                                        "Initialising FontContext for thread {:?}",
-                                        std::thread::current().id()
-                                    );
-                                    *font_ctx = Some(Box::new(doc_font_ctx.clone()));
-                                }
-                                Some(font_ctx) => {
-                                    font_ctx.collection.register_fonts(font.clone(), None);
-                                }
-                            };
-                        })
-                    });
-                }
+                // Construction workers hold snapshots of this context; a new generation makes them take a new one.
+                self.font_generation = next_font_generation();
                 drop(font_ctx);
 
                 // TODO: see if we can only invalidate if resolved fonts may have changed
@@ -1118,63 +1169,57 @@ impl BaseDocument {
         deferred_construction_nodes.sort_unstable_by_key(|task| task.node_id);
         deferred_construction_nodes.dedup_by_key(|task| task.node_id);
 
-        #[cfg(feature = "parallel-construct")]
-        let iter = deferred_construction_nodes.into_par_iter();
-        #[cfg(not(feature = "parallel-construct"))]
-        let iter = deferred_construction_nodes.into_iter();
+        let scale = self.viewport.scale();
 
-        let results: Vec<ConstructionTaskResult> = iter
-            .map(|task: ConstructionTask| match task.data {
-                ConstructionTaskData::InlineLayout(mut layout) => {
-                    #[cfg(feature = "parallel-construct")]
+        // Many tasks: shape them on rayon's workers. Each worker shapes with a snapshot of this document's font
+        // context, valid for this document's `font_generation` only, so nothing of an earlier document (fonts,
+        // generic families) is visible and the result does not depend on the thread that ran a task.
+        #[cfg(feature = "parallel-construct")]
+        if deferred_construction_nodes.len() >= PARALLEL_CONSTRUCT_MIN_TASKS {
+            let nodes = &self.nodes;
+            let font_ctx = &*self.font_ctx;
+            let generation = self.font_generation;
+            let results: Vec<ConstructionTaskResult> = deferred_construction_nodes
+                .into_par_iter()
+                .map(|task: ConstructionTask| {
                     let mut layout_ctx = LAYOUT_CTX
                         .take()
                         .unwrap_or_else(|| Box::new(LayoutContext::new()));
-                    #[cfg(feature = "parallel-construct")]
-                    let layout_ctx_mut = &mut layout_ctx;
+                    let mut worker_font_ctx = take_worker_font_ctx(generation, font_ctx);
 
-                    #[cfg(feature = "parallel-construct")]
-                    let mut font_ctx = FONT_CTX
-                        .take()
-                        .unwrap_or_else(|| Box::new(self.font_ctx.lock().unwrap().clone()));
-                    #[cfg(feature = "parallel-construct")]
-                    let font_ctx_mut = &mut font_ctx;
-
-                    #[cfg(not(feature = "parallel-construct"))]
-                    let layout_ctx_mut = &mut self.layout_ctx;
-                    #[cfg(not(feature = "parallel-construct"))]
-                    let font_ctx_mut = &mut *self.font_ctx.lock().unwrap();
-
-                    layout.content_widths = None;
-                    build_inline_layout_into(
-                        &self.nodes,
-                        layout_ctx_mut,
-                        font_ctx_mut,
-                        &mut layout,
-                        self.viewport.scale(),
-                        task.node_id,
+                    let result = run_construction_task(
+                        nodes,
+                        &mut layout_ctx,
+                        &mut worker_font_ctx,
+                        scale,
+                        task,
                     );
 
-                    #[cfg(feature = "parallel-construct")]
-                    {
-                        LAYOUT_CTX.set(Some(layout_ctx));
-                        FONT_CTX.set(Some(font_ctx));
-                    }
+                    LAYOUT_CTX.set(Some(layout_ctx));
+                    put_worker_font_ctx(generation, worker_font_ctx);
+                    result
+                })
+                .collect();
+            self.apply_construction_results(results);
+            return;
+        }
 
-                    // If layout doesn't contain any inline boxes, then it is safe to populate the content_widths
-                    // cache during this parallelized stage.
-                    // if layout.layout.inline_boxes().is_empty() {
-                    //     layout.content_widths();
-                    // }
-
-                    ConstructionTaskResult {
-                        node_id: task.node_id,
-                        data: ConstructionTaskResultData::InlineLayout(layout),
-                    }
-                }
+        let results: Vec<ConstructionTaskResult> = deferred_construction_nodes
+            .into_iter()
+            .map(|task: ConstructionTask| {
+                run_construction_task(
+                    &self.nodes,
+                    &mut self.layout_ctx,
+                    &mut self.font_ctx.lock().unwrap(),
+                    scale,
+                    task,
+                )
             })
             .collect();
+        self.apply_construction_results(results);
+    }
 
+    fn apply_construction_results(&mut self, results: Vec<ConstructionTaskResult>) {
         for result in results {
             match result.data {
                 ConstructionTaskResultData::InlineLayout(layout) => {
@@ -1390,5 +1435,120 @@ impl AsRef<BaseDocument> for BaseDocument {
 impl AsMut<BaseDocument> for BaseDocument {
     fn as_mut(&mut self) -> &mut BaseDocument {
         self
+    }
+}
+
+#[cfg(test)]
+mod font_snapshot_tests {
+    use super::*;
+    use parley::fontique::{Collection, CollectionOptions, SourceCache};
+
+    const BULLET: &str = "Bullet";
+
+    /// A font context without host fonts, with the bundled bullet face registered when `with_bullet` is set.
+    fn ctx(with_bullet: bool) -> FontContext {
+        let mut ctx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                system_fonts: false,
+                ..Default::default()
+            }),
+            source_cache: SourceCache::new(Default::default()),
+        };
+        if with_bullet {
+            ctx.collection
+                .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+        }
+        ctx
+    }
+
+    fn doc(font_ctx: FontContext) -> BaseDocument {
+        BaseDocument::new(DocumentConfig {
+            font_ctx: Some(font_ctx),
+            ..DocumentConfig::default()
+        })
+    }
+
+    fn has_bullet(ctx: &mut FontContext) -> bool {
+        ctx.collection.family_id(BULLET).is_some()
+    }
+
+    #[test]
+    fn every_document_and_every_font_registration_gets_a_new_generation() {
+        let mut a = doc(ctx(false));
+        let b = doc(ctx(false));
+        assert_ne!(a.font_generation, b.font_generation);
+
+        let before = a.font_generation;
+        a.load_resource(Resource::Font(blitz_traits::net::Bytes::from_static(
+            crate::BULLET_FONT,
+        )));
+        assert_ne!(a.font_generation, before);
+        assert_ne!(a.font_generation, b.font_generation);
+        assert!(has_bullet(&mut a.font_ctx.lock().unwrap()));
+        assert!(!has_bullet(&mut b.font_ctx.lock().unwrap()));
+    }
+
+    /// Two documents with different fonts, one worker thread: each document gets a context of its own, whatever
+    /// the thread shaped before.
+    #[cfg(feature = "parallel-construct")]
+    #[test]
+    fn a_worker_never_shapes_with_the_fonts_of_another_document() {
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let with = Mutex::new(ctx(true));
+        let without = Mutex::new(ctx(false));
+        let (g_with, g_without) = (next_font_generation(), next_font_generation());
+
+        one_worker.install(|| {
+            let mut c = take_worker_font_ctx(g_with, &with);
+            assert!(has_bullet(&mut c));
+            put_worker_font_ctx(g_with, c);
+
+            // The thread now holds the first document's context; the second document must not see it.
+            let mut c = take_worker_font_ctx(g_without, &without);
+            assert!(!has_bullet(&mut c), "font of the previous document leaked");
+            put_worker_font_ctx(g_without, c);
+
+            let mut c = take_worker_font_ctx(g_with, &with);
+            assert!(has_bullet(&mut c), "the first document lost its font");
+            put_worker_font_ctx(g_with, c);
+
+            // A font registered in the second document: a new generation makes the worker take a new snapshot.
+            without
+                .lock()
+                .unwrap()
+                .collection
+                .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+            let g_without_2 = next_font_generation();
+            let mut c = take_worker_font_ctx(g_without_2, &without);
+            assert!(
+                has_bullet(&mut c),
+                "a registered font did not reach the worker"
+            );
+            put_worker_font_ctx(g_without_2, c);
+        });
+    }
+
+    /// The same generation keeps the snapshot: no clone per task.
+    #[cfg(feature = "parallel-construct")]
+    #[test]
+    fn a_worker_reuses_its_snapshot_while_the_generation_is_unchanged() {
+        let one_worker = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let source = Mutex::new(ctx(false));
+        let generation = next_font_generation();
+        one_worker.install(|| {
+            let mut c = take_worker_font_ctx(generation, &source);
+            // Marks the snapshot; the source does not have it.
+            c.collection
+                .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+            put_worker_font_ctx(generation, c);
+            let mut c = take_worker_font_ctx(generation, &source);
+            assert!(has_bullet(&mut c), "the snapshot was cloned again");
+        });
     }
 }
