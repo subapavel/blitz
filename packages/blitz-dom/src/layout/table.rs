@@ -648,6 +648,70 @@ pub(crate) fn plan_table_children(level: Level, parts: &[TablePart]) -> Vec<Slot
     slots
 }
 
+/// The role of a row group that decides where it is placed in the table (CSS 2.1 §17.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupRole {
+    /// `table-header-group`: "always displayed before all other rows and row groups".
+    Header,
+    /// `table-footer-group`: "always displayed after all other rows and row groups".
+    Footer,
+}
+
+/// The [`GroupRole`] of `node`, by its computed `display` and not its tag (css-display-3 §2.4). `None` for anything
+/// that is not a header or footer group, and for a box that generates none (`display: none`).
+fn group_role_of(node: &Node) -> Option<GroupRole> {
+    if !node.is_element() {
+        return None;
+    }
+    let display = node.primary_styles()?.clone_display();
+    if display.outside() == DisplayOutside::None {
+        return None;
+    }
+    group_role_of_display(display.inside())
+}
+
+fn group_role_of_display(inside: DisplayInside) -> Option<GroupRole> {
+    match inside {
+        DisplayInside::TableHeaderGroup => Some(GroupRole::Header),
+        DisplayInside::TableFooterGroup => Some(GroupRole::Footer),
+        _ => None,
+    }
+}
+
+/// Puts the planned children of a table in visual order (CSS 2.1 §17.2): the first header group first and the first
+/// footer group last, wherever they were written. "If a table contains multiple elements with
+/// `display: table-header-group`, only the first is rendered as a header; the others are treated as if they had
+/// `display: table-row-group`" (the same for footers), so every other slot keeps its relative order: further header
+/// and footer groups, body groups, rows and anonymous rows. `roles` is indexed like the `Slot::Keep` indices.
+pub(crate) fn order_table_slots(slots: Vec<Slot>, roles: &[Option<GroupRole>]) -> Vec<Slot> {
+    let role_of = |slot: &Slot| match slot {
+        Slot::Keep(i) => roles.get(*i).copied().flatten(),
+        Slot::AnonymousRow(_) => None,
+    };
+    let header = slots
+        .iter()
+        .position(|slot| role_of(slot) == Some(GroupRole::Header));
+    let footer = slots
+        .iter()
+        .position(|slot| role_of(slot) == Some(GroupRole::Footer));
+    if header.is_none_or(|h| h == 0) && footer.is_none_or(|f| f == slots.len() - 1) {
+        return slots;
+    }
+    let mut head = None;
+    let mut foot = None;
+    let mut middle = Vec::with_capacity(slots.len());
+    for (i, slot) in slots.into_iter().enumerate() {
+        if Some(i) == header {
+            head = Some(slot);
+        } else if Some(i) == footer {
+            foot = Some(slot);
+        } else {
+            middle.push(slot);
+        }
+    }
+    head.into_iter().chain(middle).chain(foot).collect()
+}
+
 /// The grid being built from a table's parts: the position of the next cell and what has been collected.
 struct GridBuilder {
     is_fixed: bool,
@@ -1426,5 +1490,111 @@ mod tests {
                 .iter()
                 .all(|slot| matches!(slot, Slot::Keep(_)))
         );
+    }
+
+    #[test]
+    fn a_table_without_group_roles_keeps_its_order() {
+        let slots = vec![
+            Slot::Keep(0),
+            Slot::AnonymousRow(vec![RowSlot::Cell(1)]),
+            Slot::Keep(2),
+        ];
+        assert_eq!(order_table_slots(slots.clone(), &[None, None, None]), slots);
+        assert_eq!(order_table_slots(Vec::new(), &[]), Vec::new());
+    }
+
+    #[test]
+    fn a_footer_written_first_and_a_header_written_last_swap_places() {
+        use GroupRole::{Footer, Header};
+        // [F, B, H] is displayed as [H, B, F].
+        let roles = [Some(Footer), None, Some(Header)];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)];
+        assert_eq!(
+            order_table_slots(slots, &roles),
+            vec![Slot::Keep(2), Slot::Keep(1), Slot::Keep(0)]
+        );
+        // [H, F, B] is displayed as [H, B, F].
+        let roles = [Some(Header), Some(Footer), None];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)];
+        assert_eq!(
+            order_table_slots(slots, &roles),
+            vec![Slot::Keep(0), Slot::Keep(2), Slot::Keep(1)]
+        );
+    }
+
+    #[test]
+    fn only_the_first_footer_and_the_first_header_move() {
+        use GroupRole::{Footer, Header};
+        // [F1, B, F2] is displayed as [B, F2, F1]: F2 is a plain row group.
+        let roles = [Some(Footer), None, Some(Footer)];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)];
+        assert_eq!(
+            order_table_slots(slots, &roles),
+            vec![Slot::Keep(1), Slot::Keep(2), Slot::Keep(0)]
+        );
+        // [B, H1, H2] is displayed as [H1, B, H2].
+        let roles = [None, Some(Header), Some(Header)];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)];
+        assert_eq!(
+            order_table_slots(slots, &roles),
+            vec![Slot::Keep(1), Slot::Keep(0), Slot::Keep(2)]
+        );
+    }
+
+    #[test]
+    fn the_modern_order_is_not_touched() {
+        use GroupRole::{Footer, Header};
+        let roles = [Some(Header), None, None, Some(Footer)];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2), Slot::Keep(3)];
+        assert_eq!(order_table_slots(slots.clone(), &roles), slots);
+        // Two headers written first: the second one is a body group and stays behind the first.
+        let roles = [Some(Header), Some(Header), None];
+        let slots = vec![Slot::Keep(0), Slot::Keep(1), Slot::Keep(2)];
+        assert_eq!(order_table_slots(slots.clone(), &roles), slots);
+    }
+
+    #[test]
+    fn bare_and_anonymous_rows_keep_their_place_among_the_bodies() {
+        use GroupRole::{Footer, Header};
+        // Slots: footer, bare row, anonymous row, body group, header.
+        let roles = [Some(Footer), None, None, None, Some(Header)];
+        let slots = vec![
+            Slot::Keep(0),
+            Slot::Keep(1),
+            Slot::AnonymousRow(vec![RowSlot::AnonymousCell(2..3)]),
+            Slot::Keep(3),
+            Slot::Keep(4),
+        ];
+        assert_eq!(
+            order_table_slots(slots, &roles),
+            vec![
+                Slot::Keep(4),
+                Slot::Keep(1),
+                Slot::AnonymousRow(vec![RowSlot::AnonymousCell(2..3)]),
+                Slot::Keep(3),
+                Slot::Keep(0),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_group_role_is_decided_by_display() {
+        assert_eq!(
+            group_role_of_display(DisplayInside::TableHeaderGroup),
+            Some(GroupRole::Header)
+        );
+        assert_eq!(
+            group_role_of_display(DisplayInside::TableFooterGroup),
+            Some(GroupRole::Footer)
+        );
+        for inside in [
+            DisplayInside::TableRowGroup,
+            DisplayInside::TableRow,
+            DisplayInside::TableCell,
+            DisplayInside::Flow,
+            DisplayInside::Table,
+        ] {
+            assert_eq!(group_role_of_display(inside), None, "{inside:?}");
+        }
     }
 }
