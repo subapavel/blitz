@@ -3,7 +3,10 @@ use std::{collections::BTreeMap, ops::Range, sync::Arc};
 use markup5ever::local_name;
 use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
-use style::{Atom, computed_values::table_layout::T as TableLayout};
+use style::{
+    Atom,
+    computed_values::{border_collapse::T as BorderCollapse, table_layout::T as TableLayout},
+};
 use taffy::{
     Dimension, LayoutInput, LayoutOutput, LayoutPartialTree as _, NodeId, Position, ResolveOrZero,
     RunMode, Size, TrackSizingFunction, compute_leaf_layout, style_helpers,
@@ -12,6 +15,9 @@ use taffy::{
 use crate::BaseDocument;
 use crate::node::{Node, NodeData};
 
+use super::collapsed_borders::{
+    self, BorderSpec, CellInput, CollapsedBorders, GroupInput, RowInput,
+};
 use super::compute_node_layout;
 use super::construct::create_anonymous_block;
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
@@ -29,6 +35,16 @@ pub struct TableContext {
     /// The columns of an automatic layout that have an explicit length `width`: they are never narrower than their
     /// cells' min-content widths, see [`widen_explicit_columns`].
     explicit_columns: Vec<ExplicitColumn>,
+    /// The resolved borders of a table in the collapsing border model (`border-collapse: collapse`); `None` for a
+    /// separated table, which this code does not touch.
+    collapsed: Option<Arc<CollapsedBorders>>,
+}
+
+impl TableContext {
+    /// The collapsed borders of the table, or `None` when it is in the separated border model (or has no cells).
+    pub fn collapsed_borders(&self) -> Option<&CollapsedBorders> {
+        self.collapsed.as_deref()
+    }
 }
 
 /// A grid track with an explicit length or percentage width (`push_cell_item`) and the items of the cells that start in
@@ -76,32 +92,40 @@ pub(crate) fn build_table_context(
     let mut style = stylo_taffy::to_taffy_style(&stylo_styles);
     style.grid_auto_columns = Vec::new();
     style.grid_auto_rows = Vec::new();
-    // A table is at least as tall as its rows (CSS 2.1 §17.5.3): a fixed `height` must not clip them.
-    height_as_table_minimum(&mut style);
-    grid_container_min_height(&mut style);
 
     let is_fixed = match stylo_styles.clone_table_layout() {
         TableLayout::Fixed => true,
         TableLayout::Auto => false,
     };
 
+    // `border-collapse` is inherited, so a `display: table` box and a table nested in a collapsing one follow the
+    // cascade; the table's own computed value decides (CSS 2.1 §17.6).
+    let collapse = stylo_styles.clone_border_collapse() == BorderCollapse::Collapse;
+    let table_edges = border_edges(&stylo_styles);
+
     drop(stylo_styles);
 
     let mut grid = GridBuilder {
         is_fixed,
+        collapse,
         row: 0,
         col: 0,
+        group: None,
         items: Vec::new(),
         columns: BTreeMap::new(),
         first_row_width: 0,
         placements: Vec::new(),
+        row_owners: Vec::new(),
+        width_events: Vec::new(),
     };
     collect_table_children(doc, table_root_node_id, &children, Level::Table, &mut grid);
     let GridBuilder {
         row,
         mut items,
-        columns,
+        mut columns,
         placements,
+        row_owners,
+        width_events,
         ..
     } = grid;
 
@@ -116,6 +140,20 @@ pub(crate) fn build_table_context(
             end: style_helpers::span(span),
         };
     }
+
+    // The collapsing border model (CSS 2.1 §17.6.2): resolve the border of every segment of the grid lines.
+    let collapsed = (collapse && !tracks.is_empty() && !row_owners.is_empty()).then(|| {
+        Arc::new(resolve_collapsed(
+            doc,
+            &row_owners,
+            &placements,
+            &tracks,
+            &items,
+            table_edges,
+        ))
+    });
+    let _ = &width_events;
+
     style.grid_template_columns = tracks
         .iter()
         .map(|column| {
@@ -154,6 +192,10 @@ pub(crate) fn build_table_context(
         }
     }
 
+    // A table is at least as tall as its rows (CSS 2.1 §17.5.3): a fixed `height` must not clip them.
+    height_as_table_minimum(&mut style);
+    grid_container_min_height(&mut style);
+
     let layout_children = items
         .iter()
         .filter(|item| item.kind == TableItemKind::Cell)
@@ -167,9 +209,96 @@ pub(crate) fn build_table_context(
             style,
             items,
             explicit_columns,
+            collapsed,
         },
         layout_children,
     )
+}
+
+/// The four borders of an element, `[top, right, bottom, left]`: the computed width (0 for `none` and `hidden`), the
+/// style, and the colour resolved against the element's own `currentColor`.
+fn border_edges(styles: &style::properties::ComputedValues) -> [BorderSpec; 4] {
+    let border = styles.get_border();
+    let current = styles.clone_color();
+    let edge = |width: f32, style, color: &style::values::computed::Color| BorderSpec {
+        width,
+        style,
+        color: color.resolve_to_absolute(&current),
+    };
+    [
+        edge(
+            border.border_top_width.to_f32_px(),
+            border.border_top_style,
+            &border.border_top_color,
+        ),
+        edge(
+            border.border_right_width.to_f32_px(),
+            border.border_right_style,
+            &border.border_right_color,
+        ),
+        edge(
+            border.border_bottom_width.to_f32_px(),
+            border.border_bottom_style,
+            &border.border_bottom_color,
+        ),
+        edge(
+            border.border_left_width.to_f32_px(),
+            border.border_left_style,
+            &border.border_left_color,
+        ),
+    ]
+}
+
+/// The borders of a node, none for a node without styles.
+fn node_border_edges(doc: &BaseDocument, node_id: usize) -> [BorderSpec; 4] {
+    doc.nodes[node_id]
+        .primary_styles()
+        .map_or([BorderSpec::NONE; 4], |styles| border_edges(&styles))
+}
+
+/// Reads the borders of the rows, row groups and cells of the collected grid and resolves the collapsed borders of the
+/// table (`table_edges` are its own). `tracks` must not be empty.
+fn resolve_collapsed(
+    doc: &BaseDocument,
+    owners: &[RowOwner],
+    placements: &[CellPlacement],
+    tracks: &[u32],
+    items: &[TableItem],
+    table_edges: [BorderSpec; 4],
+) -> CollapsedBorders {
+    let mut rows = Vec::with_capacity(owners.len());
+    // The rows of a group are consecutive: read its borders once.
+    let mut group_edges: Option<(usize, [BorderSpec; 4])> = None;
+    for owner in owners {
+        let row = owner.row.map(|id| node_border_edges(doc, id));
+        let group = owner.group.map(|id| {
+            let edges = match group_edges {
+                Some((group, edges)) if group == id => edges,
+                _ => {
+                    let edges = node_border_edges(doc, id);
+                    group_edges = Some((id, edges));
+                    edges
+                }
+            };
+            GroupInput { id, edges }
+        });
+        rows.push(RowInput { row, group });
+    }
+    let cells: Vec<CellInput> = placements
+        .iter()
+        .map(|p| {
+            let (line, span) = grid_column(tracks, p.start, p.span);
+            let node = items[p.item].node_id;
+            CellInput {
+                node,
+                row: u32::from(p.row) - 1,
+                track: (line - 1) as u32,
+                span: u32::from(span),
+                edges: node_border_edges(doc, node),
+            }
+        })
+        .collect();
+    collapsed_borders::resolve(&rows, tracks.len() as u32, &cells, table_edges)
 }
 
 /// A column of an automatic table layout is never narrower than the largest min-content width of its cells (CSS 2.1
@@ -282,8 +411,8 @@ fn table_content_width(style: &taffy::Style<Atom>, inputs: &LayoutInput) -> Opti
 /// The border-box width of a cell with an explicit length `width`, which is what its column track needs.
 /// Under `content-box` the horizontal padding and border are added; under `border-box` the width already
 /// includes them, but never shrinks below them (css-sizing-3 §5.1).
-fn cell_border_box_width(style: &taffy::Style<Atom>) -> f32 {
-    let len = style.size.width.value();
+fn cell_border_box_width(width: Dimension, style: &taffy::Style<Atom>) -> f32 {
+    let len = width.value();
     let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
     let border = style.border.resolve_or_zero(None, resolve_calc_value);
     let padding_border = padding.left + padding.right + border.left + border.right;
@@ -364,6 +493,51 @@ fn parse_colspan(value: Option<&str>) -> u32 {
     if span == 0 { 1 } else { span.min(MAX_COLSPAN) }
 }
 
+/// Folds one cell's `width` into the column widths: the first row sets the width of the column each of its cells starts
+/// in (a `calc()` that survives Stylo's simplification mixes a percentage and a non-zero length; on a table cell it
+/// MUST be treated as `auto`, css-values-4 § Computed Value of math expressions), a later row's cell with a length
+/// `width` widens the column it starts in when that is one of the first row's. `style` is the cell's item style, whose
+/// padding and border enter the border-box width of a length. Called once per cell while the grid is collected, and
+/// again for every cell of a collapsing table once its borders are known.
+fn fold_column_width(
+    columns: &mut BTreeMap<u32, Dimension>,
+    first_row_width: &mut u32,
+    is_fixed: bool,
+    event: &WidthEvent,
+    style: &taffy::Style<Atom>,
+) {
+    let (start, width) = (event.start, event.width);
+    if event.first_row {
+        // `tag()` of a calc value is not a valid tag, so test it first.
+        let column = if width.into_raw().is_calc() {
+            style_helpers::auto()
+        } else {
+            match width.tag() {
+                taffy::CompactLength::LENGTH_TAG => {
+                    style_helpers::length(cell_border_box_width(width, style))
+                }
+                taffy::CompactLength::PERCENT_TAG => style_helpers::percent(width.value()),
+                taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
+                _ => unreachable!(),
+            }
+        };
+        columns.insert(start, column);
+        *first_row_width = start.saturating_add(event.colspan);
+    } else if !is_fixed
+        && start < *first_row_width
+        && taffy::CompactLength::LENGTH_TAG == width.tag()
+    {
+        let new_len = cell_border_box_width(width, style);
+        let column = columns.entry(start).or_insert_with(style_helpers::auto);
+        *column = match column.tag() {
+            taffy::CompactLength::LENGTH_TAG => style_helpers::length(column.value().max(new_len)),
+            taffy::CompactLength::AUTO_TAG => style_helpers::length(new_len),
+            taffy::CompactLength::PERCENT_TAG => style_helpers::percent(column.value()),
+            _ => unreachable!(),
+        };
+    }
+}
+
 /// Adds the table cell `node_id` (a `display: table-cell` element, or an anonymous cell) to the grid: its column
 /// width from the first row (or a wider `width` below it), its style as a grid item and its [`CellPlacement`]. Its
 /// grid position is set by [`build_table_context`] once every row is known.
@@ -375,41 +549,22 @@ fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
     let mut style = stylo_taffy::to_taffy_style(stylo_style);
 
     // TODO: account for padding/border/margin
-    if grid.row == 1 {
-        // A `calc()` that survives Stylo's simplification mixes a percentage and a non-zero length;
-        // on a table cell it MUST be treated as `auto` (css-values-4 § Computed Value of math
-        // expressions). `tag()` of a calc value is not a valid tag, so test it first.
-        let column = if style.size.width.into_raw().is_calc() {
-            style_helpers::auto()
-        } else {
-            match style.size.width.tag() {
-                taffy::CompactLength::LENGTH_TAG => {
-                    style_helpers::length(cell_border_box_width(&style))
-                }
-                taffy::CompactLength::PERCENT_TAG => {
-                    style_helpers::percent(style.size.width.value())
-                }
-                taffy::CompactLength::AUTO_TAG => style_helpers::auto(),
-                _ => unreachable!(),
-            }
-        };
-        grid.columns.insert(start, column);
-        grid.first_row_width = start.saturating_add(colspan);
-    } else if !grid.is_fixed
-        && start < grid.first_row_width
-        && taffy::CompactLength::LENGTH_TAG == style.size.width.tag()
-    {
-        let new_len = cell_border_box_width(&style);
-        let column = grid
-            .columns
-            .entry(start)
-            .or_insert_with(style_helpers::auto);
-        *column = match column.tag() {
-            taffy::CompactLength::LENGTH_TAG => style_helpers::length(column.value().max(new_len)),
-            taffy::CompactLength::AUTO_TAG => style_helpers::length(new_len),
-            taffy::CompactLength::PERCENT_TAG => style_helpers::percent(column.value()),
-            _ => unreachable!(),
-        };
+    let event = WidthEvent {
+        item: grid.items.len(),
+        start,
+        colspan,
+        first_row: grid.row == 1,
+        width: style.size.width,
+    };
+    fold_column_width(
+        &mut grid.columns,
+        &mut grid.first_row_width,
+        grid.is_fixed,
+        &event,
+        &style,
+    );
+    if grid.collapse {
+        grid.width_events.push(event);
     }
 
     style.grid_row = taffy::Line {
@@ -422,6 +577,7 @@ fn push_cell_item(doc: &BaseDocument, node_id: usize, grid: &mut GridBuilder) {
         item: grid.items.len(),
         start,
         span: colspan,
+        row: grid.row,
     });
     grid.items.push(TableItem {
         kind: TableItemKind::Cell,
@@ -439,6 +595,8 @@ struct CellPlacement {
     item: usize,
     start: u32,
     span: u32,
+    /// The grid row, from 1.
+    row: u16,
 }
 
 /// Whether the table's columns are laid out by the fixed table algorithm (CSS 2.1 §17.5.2.1: every column the widest
@@ -715,15 +873,42 @@ pub(crate) fn order_table_slots(slots: Vec<Slot>, roles: &[Option<GroupRole>]) -
 /// The grid being built from a table's parts: the position of the next cell and what has been collected.
 struct GridBuilder {
     is_fixed: bool,
+    /// The table is in the collapsing border model: the column widths are folded again once the borders are known.
+    collapse: bool,
     row: u16,
     /// The raw column the next cell of the row starts in.
     col: u32,
+    /// The row group being collected (its node id), `None` directly under the table.
+    group: Option<usize>,
     items: Vec<TableItem>,
     /// The width of the column each first-row cell starts in (or a wider one below it), by raw column.
     columns: BTreeMap<u32, Dimension>,
     /// The raw columns of the first row; a later row's cell widens a column only if it starts within them.
     first_row_width: u32,
     placements: Vec<CellPlacement>,
+    /// One per grid row: the `<tr>` (or none, for an anonymous row) and the row group it is in.
+    row_owners: Vec<RowOwner>,
+    /// What each cell contributed to the column widths, in order (`collapse` only), to fold them again with the
+    /// collapsed border widths, see [`fold_column_width`].
+    width_events: Vec<WidthEvent>,
+}
+
+/// The elements that own a grid row: its `<tr>` node (an anonymous row has none) and its row group.
+#[derive(Debug, Clone, Copy)]
+struct RowOwner {
+    row: Option<usize>,
+    group: Option<usize>,
+}
+
+/// What a cell contributes to the width of the column it starts in: its own `width`, and whether it is in the first
+/// row.
+#[derive(Debug, Clone, Copy)]
+struct WidthEvent {
+    item: usize,
+    start: u32,
+    colspan: u32,
+    first_row: bool,
+    width: Dimension,
 }
 
 /// Hidden boxes, columns and captions are not constructed: they have no box in the table.
@@ -789,6 +974,10 @@ fn collect_table_children(
             Slot::AnonymousRow(slots) => {
                 grid.row += 1;
                 grid.col = 0;
+                grid.row_owners.push(RowOwner {
+                    row: None,
+                    group: grid.group,
+                });
                 has_anonymous = true;
                 layout_children.extend(push_row_slots(doc, parent_id, &ids, &slots, grid));
             }
@@ -799,8 +988,10 @@ fn collect_table_children(
 
 fn collect_row_group(doc: &mut BaseDocument, group_id: usize, grid: &mut GridBuilder) {
     let children = std::mem::take(&mut doc.nodes[group_id].children);
+    let outer_group = grid.group.replace(group_id);
     let (layout_children, has_anonymous) =
         collect_table_children(doc, group_id, &children, Level::RowGroup, grid);
+    grid.group = outer_group;
     let group = &mut doc.nodes[group_id];
     group.children = children;
     // Rows and the cells of anonymous rows, so that a walk over the layout children finds them all.
@@ -812,6 +1003,10 @@ fn collect_row(doc: &mut BaseDocument, row_id: usize, grid: &mut GridBuilder) {
     node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
     grid.row += 1;
     grid.col = 0;
+    grid.row_owners.push(RowOwner {
+        row: Some(row_id),
+        group: grid.group,
+    });
 
     {
         let stylo_style = &node.primary_styles().unwrap();
@@ -1228,6 +1423,7 @@ mod tests {
                     item: out.len(),
                     start,
                     span,
+                    row: 0,
                 });
                 start += span;
             }
