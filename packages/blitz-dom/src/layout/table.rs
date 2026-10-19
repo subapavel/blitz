@@ -152,7 +152,32 @@ pub(crate) fn build_table_context(
             table_edges,
         ))
     });
-    let _ = &width_events;
+    match &collapsed {
+        Some(result) => {
+            collapse_geometry(
+                doc,
+                table_root_node_id,
+                result,
+                &placements,
+                &mut items,
+                &mut style,
+            );
+            // The explicit widths of the first row's columns hold the cells' new borders (under `content-box`).
+            columns.clear();
+            let mut first_row_width = 0;
+            for event in &width_events {
+                fold_column_width(
+                    &mut columns,
+                    &mut first_row_width,
+                    is_fixed,
+                    event,
+                    &items[event.item].style,
+                );
+            }
+        }
+        // Not (or no longer) a collapsing table: no node keeps halves from an earlier construction.
+        None => release_collapsed(doc, table_root_node_id, &items),
+    }
 
     style.grid_template_columns = tracks
         .iter()
@@ -299,6 +324,58 @@ fn resolve_collapsed(
         })
         .collect();
     collapsed_borders::resolve(&rows, tracks.len() as u32, &cells, table_edges)
+}
+
+fn border_lengths(sides: taffy::Rect<f32>) -> taffy::Rect<taffy::LengthPercentage> {
+    taffy::Rect {
+        left: taffy::LengthPercentage::length(sides.left),
+        right: taffy::LengthPercentage::length(sides.right),
+        top: taffy::LengthPercentage::length(sides.top),
+        bottom: taffy::LengthPercentage::length(sides.bottom),
+    }
+}
+
+/// Lays a collapsing table out with its resolved borders (CSS 2.1 §17.6.2): each cell has half of the collapsed
+/// border on each side (so two neighbours share one line, centred on the grid line), the table holds half of its
+/// outer lines and has no padding ("a table does not have padding"), and the rows have neither border nor padding
+/// (their borders are part of the lines).
+///
+/// The halves go to the items' styles (what the grid reads), to `style` (the grid container) and to the nodes'
+/// `collapsed_border` (what `flush_styles_to_layout` puts back into a node's own Taffy style after construction: a
+/// cell lays its content out from that one, and the table is measured by its parent through it).
+fn collapse_geometry(
+    doc: &mut BaseDocument,
+    table_id: usize,
+    collapsed: &CollapsedBorders,
+    placements: &[CellPlacement],
+    items: &mut [TableItem],
+    style: &mut taffy::Style<Atom>,
+) {
+    for (i, placement) in placements.iter().enumerate() {
+        let halves = collapsed.cell_half_widths(i);
+        let item = &mut items[placement.item];
+        item.style.border = border_lengths(halves);
+        doc.nodes[item.node_id].collapsed_border = Some(halves);
+    }
+    let none = border_lengths(taffy::Rect::ZERO);
+    for item in items.iter_mut().filter(|i| i.kind == TableItemKind::Row) {
+        item.style.border = none;
+        item.style.padding = none;
+    }
+    let halves = collapsed.table_half_widths();
+    style.border = border_lengths(halves);
+    style.padding = none;
+    doc.nodes[table_id].collapsed_border = Some(halves);
+}
+
+/// Forgets the collapsed borders an earlier construction of this table left on its nodes.
+fn release_collapsed(doc: &mut BaseDocument, table_id: usize, items: &[TableItem]) {
+    if doc.nodes[table_id].collapsed_border.take().is_none() {
+        return;
+    }
+    for item in items.iter().filter(|i| i.kind == TableItemKind::Cell) {
+        doc.nodes[item.node_id].collapsed_border = None;
+    }
 }
 
 /// A column of an automatic table layout is never narrower than the largest min-content width of its cells (CSS 2.1

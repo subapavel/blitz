@@ -310,6 +310,25 @@ impl BaseDocument {
             ) {
                 super::table::height_as_table_minimum(&mut node.style);
             }
+            // A table and its cells in the collapsing border model have half of the collapsed borders on each side,
+            // which Stylo does not know (see `layout/table.rs`, `collapse_geometry`); a table has no padding.
+            if let Some(border) = node.collapsed_border {
+                let length = taffy::LengthPercentage::length;
+                node.style.border = taffy::Rect {
+                    left: length(border.left),
+                    right: length(border.right),
+                    top: length(border.top),
+                    bottom: length(border.bottom),
+                };
+                if style.clone_display().inside() == DisplayInside::Table {
+                    node.style.padding = taffy::Rect {
+                        left: length(0.0),
+                        right: length(0.0),
+                        top: length(0.0),
+                        bottom: length(0.0),
+                    };
+                }
+            }
             if let Some(element) = node.data.downcast_element() {
                 let tag = element.name.local.as_ref();
                 // HTML §15.4.3: the `width` / `height` attributes of an <img> are presentational hints,

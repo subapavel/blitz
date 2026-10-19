@@ -117,6 +117,11 @@ pub struct Node {
     /// the top padding of the cell's layout so that consumers placing inline content (which has no child
     /// boxes to shift) see it. Zero for every other node.
     pub table_cell_offset: f32,
+    /// For a table cell, and for the table itself, in the collapsing border model (`border-collapse: collapse`): the
+    /// border widths in CSS px that the table's construction resolved (half of the collapsed borders on each side).
+    /// `flush_styles_to_layout` rebuilds the node's Taffy style from Stylo, which knows nothing of them, and applies
+    /// these on top. `None` for every other node.
+    pub collapsed_border: Option<taffy::Rect<f32>>,
     pub scroll_offset: crate::Point<f64>,
 }
 
@@ -159,6 +164,7 @@ impl Node {
             unrounded_layout: Layout::new(),
             final_layout: Layout::new(),
             table_cell_offset: 0.0,
+            collapsed_border: None,
             scroll_offset: crate::Point::ZERO,
         }
     }
