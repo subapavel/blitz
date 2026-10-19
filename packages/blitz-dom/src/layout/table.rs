@@ -740,7 +740,7 @@ fn release_skipped(doc: &BaseDocument, ids: &[usize], parts: &[TablePart]) {
 
 /// Collects the children `children` of the table (`parent_id`, whose own `children` were taken by the caller) or
 /// of a row group into `grid`. Returns the layout children of the container (its rows and the cells of its
-/// anonymous rows, in DOM order) and whether there is an anonymous row among them.
+/// anonymous rows, in visual order) and whether there is an anonymous row among them.
 fn collect_table_children(
     doc: &mut BaseDocument,
     parent_id: usize,
@@ -756,9 +756,26 @@ fn collect_table_children(
         .collect();
     release_skipped(doc, &ids, &parts);
 
+    // The table's rows and groups are laid out in visual order (CSS 2.1 §17.2): the first header group first and
+    // the first footer group last. Rows, cells, grid lines and the layout children all follow from this order. A row
+    // group keeps its rows as written.
+    let mut slots = plan_table_children(level, &parts);
+    if level == Level::Table {
+        let roles: Vec<Option<GroupRole>> = ids
+            .iter()
+            .zip(&parts)
+            .map(|(&id, part)| {
+                (*part == TablePart::RowGroup)
+                    .then(|| group_role_of(&doc.nodes[id]))
+                    .flatten()
+            })
+            .collect();
+        slots = order_table_slots(slots, &roles);
+    }
+
     let mut layout_children = Vec::new();
     let mut has_anonymous = false;
-    for slot in plan_table_children(level, &parts) {
+    for slot in slots {
         match slot {
             Slot::Keep(i) => {
                 let id = ids[i];
