@@ -1,4 +1,4 @@
-use crate::{HtmlParserProvider, net::Resource};
+use crate::{HtmlParserProvider, SharedStyles, net::Resource};
 use blitz_traits::{
     navigation::NavigationProvider,
     net::NetProvider,
@@ -26,4 +26,8 @@ pub struct DocumentConfig {
     pub html_parser_provider: Option<Arc<dyn HtmlParserProvider>>,
     /// Parley `FontContext`
     pub font_ctx: Option<FontContext>,
+    /// A style lock, user agent sheets and author sheets shared with other documents. With `Some`, the document
+    /// uses this lock instead of a new one and starts with these sheets instead of parsing Blitz's own;
+    /// `ua_stylesheets` must be `None` and `base_url` must equal the one of the `SharedStyles`.
+    pub shared_styles: Option<SharedStyles>,
 }

@@ -50,6 +50,7 @@ mod html;
 mod layout;
 mod mutator;
 mod query_selector;
+mod shared_styles;
 /// Implementations that interact with servo's style engine
 mod stylo;
 mod stylo_to_cursor_icon;
@@ -72,6 +73,7 @@ pub use markup5ever::{
 pub use mutator::DocumentMutator;
 pub use node::{Attribute, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
+pub use shared_styles::SharedStyles;
 pub use style::Atom;
 pub use style::invalidation::element::restyle_hints::RestyleHint;
 pub type SelectorList = selectors::SelectorList<style::selector_parser::SelectorImpl>;

@@ -293,7 +293,10 @@ impl BaseDocument {
         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
         let snapshots = SnapshotMap::new();
         let nodes = Box::new(Slab::new());
-        let guard = SharedRwLock::new();
+        let guard = match &config.shared_styles {
+            Some(shared) => shared.lock().clone(),
+            None => SharedRwLock::new(),
+        };
         let nodes_to_id = HashMap::new();
 
         // Make sure we turn on stylo features
@@ -303,6 +306,7 @@ impl BaseDocument {
         style_config::set_bool("layout.unimplemented", true);
         style_config::set_bool("layout.columns.enabled", true);
 
+        let config_base_url = config.base_url.clone();
         let base_url = config
             .base_url
             .and_then(|url| DocumentUrl::from_str(&url).ok())
@@ -358,13 +362,30 @@ impl BaseDocument {
         doc.create_node(NodeData::Document);
         doc.root_node_mut().flags.insert(NodeFlags::IS_IN_DOCUMENT);
 
-        match config.ua_stylesheets {
-            Some(stylesheets) => {
+        match (&config.shared_styles, config.ua_stylesheets) {
+            (Some(shared), ua_stylesheets) => {
+                debug_assert!(ua_stylesheets.is_none());
+                debug_assert_eq!(
+                    config_base_url.as_deref(),
+                    Some(shared.base_url()),
+                    "a document with shared styles must use their base URL"
+                );
+                for (text, sheet) in shared.ua_sheets() {
+                    doc.ua_stylesheets.insert(text.clone(), sheet.clone());
+                    doc.stylist
+                        .append_stylesheet(sheet.clone(), &doc.guard.read());
+                }
+                for sheet in shared.author_sheets() {
+                    doc.stylist
+                        .append_stylesheet(sheet.clone(), &doc.guard.read());
+                }
+            }
+            (None, Some(stylesheets)) => {
                 for ss in &stylesheets {
                     doc.add_user_agent_stylesheet(ss);
                 }
             }
-            None => doc.add_user_agent_stylesheet(DEFAULT_CSS),
+            (None, None) => doc.add_user_agent_stylesheet(DEFAULT_CSS),
         }
 
         // Stylo data on the root node container is needed to render the node
@@ -664,6 +685,11 @@ impl BaseDocument {
         let css = html_escape::decode_html_entities(&css);
         let sheet = self.make_stylesheet(&css, Origin::Author);
         self.add_stylesheet_for_node(sheet, target_id);
+    }
+
+    /// The sheet a `<style>` / `<link>` node contributes, if it has one.
+    pub fn stylesheet_of_node(&self, node_id: usize) -> Option<DocumentStyleSheet> {
+        self.nodes_to_stylesheet.get(&node_id).cloned()
     }
 
     pub fn remove_user_agent_stylesheet(&mut self, contents: &str) {
