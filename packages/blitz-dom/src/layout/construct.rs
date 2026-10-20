@@ -602,8 +602,12 @@ fn place_box_child(
     // Skip comment nodes. Note that we do *not* skip `Display::None` nodes as they may need to be hidden.
     // Taffy knows how to deal with `Display::None` children.
     //
-    // Also hide all-whitespace flexbox children as these should be ignored
-    if child_node_kind == NodeKind::Comment || (hide_whitespace && is_whitespace_node) {
+    // Also hide all-whitespace flexbox children as these should be ignored. Whitespace inside a run of text is
+    // part of the run (css-flexbox-1 §4, css-grid-2 §6): the run can reach across the boundary of a
+    // `display: contents` element (`a<s> </s>b`), so only whitespace that would start a run is hidden.
+    if child_node_kind == NodeKind::Comment
+        || (hide_whitespace && is_whitespace_node && anonymous_block_id.is_none())
+    {
         // return;
     }
     // A `display: contents` node is replaced by its pseudo-elements and children
@@ -943,15 +947,62 @@ pub(crate) fn build_inline_layout_into(
             root_line_height,
         );
     }
+    // The children of an anonymous block can come from inside `display: contents` elements (they generate no
+    // box, so their children were placed in the block). Each element that matters for the text (see
+    // `contents_needs_span`) stays open as a style span while its children are built, so the text keeps the
+    // style and the brush of its own parent and not those of the block.
+    let mut open: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
     for child_id in root_node.children.iter().copied() {
-        build_root_child(
+        let mut chain: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+        if root_node.data.kind() == NodeKind::AnonymousBlock {
+            let mut parent = nodes[child_id].parent;
+            while let Some(parent_id) = parent {
+                if parent_id == root_node.id || Some(parent_id) == root_node.parent {
+                    break;
+                }
+                let wrapper = &nodes[parent_id];
+                if !wrapper
+                    .display_style()
+                    .is_some_and(|d| d.inside() == DisplayInside::Contents)
+                {
+                    break;
+                }
+                if contents_needs_span(nodes, wrapper) {
+                    chain.push(parent_id);
+                }
+                parent = wrapper.parent;
+            }
+            // Outermost first.
+            chain.reverse();
+        }
+
+        let common = open.iter().zip(&chain).take_while(|(a, b)| a == b).count();
+        while open.len() > common {
+            builder.pop_style_span();
+            open.pop();
+        }
+        for &wrapper_id in &chain[common..] {
+            builder.push_style_span(inline_span_style(&nodes[wrapper_id], root_line_height));
+            open.push(wrapper_id);
+        }
+        let collapse_mode = open
+            .last()
+            .and_then(|&id| nodes[id].primary_styles())
+            .map(|s| {
+                stylo_to_parley::white_space_collapse(s.get_inherited_text().white_space_collapse)
+            })
+            .unwrap_or(collapse_mode);
+        build_inline_layout_recursive(
             &mut builder,
             nodes,
-            root_node,
+            inline_context_root_node_id,
             child_id,
             collapse_mode,
             root_line_height,
         );
+    }
+    while open.pop().is_some() {
+        builder.pop_style_span();
     }
     if let Some(after_id) = root_node.after {
         build_inline_layout_recursive(
@@ -967,58 +1018,33 @@ pub(crate) fn build_inline_layout_into(
     text_layout.text = builder.build_into(&mut text_layout.layout);
     return;
 
-    /// Builds a child of the inline root. The children of an anonymous block can come from inside
-    /// `display: contents` elements (they generate no box, so their children were placed in the block): each of
-    /// those elements is entered as a style span so that the text keeps the style and the brush of its own
-    /// parent and not those of the block.
-    fn build_root_child(
-        builder: &mut TreeBuilder<TextBrush>,
-        nodes: &Slab<Node>,
-        root_node: &Node,
-        child_id: usize,
-        collapse_mode: WhiteSpaceCollapse,
-        root_line_height: f32,
-    ) {
-        let mut wrappers: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
-        if root_node.data.kind() == NodeKind::AnonymousBlock {
-            let mut parent = nodes[child_id].parent;
-            while let Some(parent_id) = parent {
-                if parent_id == root_node.id || Some(parent_id) == root_node.parent {
-                    break;
-                }
-                let is_contents = nodes[parent_id]
-                    .display_style()
-                    .is_some_and(|d| d.inside() == DisplayInside::Contents);
-                if !is_contents {
-                    break;
-                }
-                wrappers.push(parent_id);
-                parent = nodes[parent_id].parent;
-            }
+    /// Whether a `display: contents` element needs a style span of its own in an inline layout. It does not when
+    /// its text style, colour and white-space mode equal those of its parent, it draws no text decoration and it is
+    /// not a link: its children then build exactly as they would without it, and a span would only add the
+    /// whitespace trimming Parley does at the boundaries of a span.
+    fn contents_needs_span(nodes: &Slab<Node>, node: &Node) -> bool {
+        let (Some(styles), Some(parent_styles)) = (
+            node.primary_styles(),
+            node.parent
+                .and_then(|parent| nodes[parent].primary_styles()),
+        ) else {
+            return true;
+        };
+        if node
+            .element_data()
+            .is_some_and(|el| el.name.local == local_name!("a"))
+            || !styles.clone_text_decoration_line().is_empty()
+            || styles.clone_color() != parent_styles.clone_color()
+            || styles.get_inherited_text().white_space_collapse
+                != parent_styles.get_inherited_text().white_space_collapse
+        {
+            return true;
         }
-
-        // Outermost first.
-        let mut collapse_mode = collapse_mode;
-        for &wrapper_id in wrappers.iter().rev() {
-            let wrapper = &nodes[wrapper_id];
-            builder.push_style_span(inline_span_style(wrapper, root_line_height));
-            if let Some(style) = wrapper.primary_styles() {
-                collapse_mode = stylo_to_parley::white_space_collapse(
-                    style.get_inherited_text().white_space_collapse,
-                );
-            }
-        }
-        build_inline_layout_recursive(
-            builder,
-            nodes,
-            root_node.id,
-            child_id,
-            collapse_mode,
-            root_line_height,
-        );
-        for _ in &wrappers {
-            builder.pop_style_span();
-        }
+        let mut own = stylo_to_parley::style(node.id, &styles);
+        let mut parent = stylo_to_parley::style(node.id, &parent_styles);
+        own.brush = parent.brush;
+        parent.brush = own.brush;
+        own != parent
     }
 
     /// The Parley style of the span of an inline element (or `display: contents` element).
@@ -1080,7 +1106,10 @@ pub(crate) fn build_inline_layout_into(
                     (DisplayOutside::None, DisplayInside::Contents) => {
                         // The element generates no box, but its text style is inherited by its children and
                         // its brush identifies them (colour, decoration, link) in the paint.
-                        builder.push_style_span(inline_span_style(node, root_line_height));
+                        let span = contents_needs_span(nodes, node);
+                        if span {
+                            builder.push_style_span(inline_span_style(node, root_line_height));
+                        }
                         for child_id in node
                             .before
                             .into_iter()
@@ -1096,7 +1125,9 @@ pub(crate) fn build_inline_layout_into(
                                 root_line_height,
                             );
                         }
-                        builder.pop_style_span();
+                        if span {
+                            builder.pop_style_span();
+                        }
                     }
                     (DisplayOutside::Inline, DisplayInside::Flow) => {
                         let tag_name = &element_data.name.local;
@@ -1523,6 +1554,30 @@ mod contents_tests {
         assert_live(&doc, 0);
     }
 
+    /// Whitespace between two texts is part of their run, also when the texts are on either side of a contents
+    /// element; whitespace that would start a run is hidden in a flex container.
+    #[test]
+    fn flex_whitespace_inside_a_text_run_is_kept() {
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "f",
+            "display:flex",
+            vec![
+                T("ws0", " "),
+                T("a", "a"),
+                E("span", "w", C, vec![T("sp", " ")]),
+                T("b", "b"),
+                E("div", "d", "", vec![T("t", "d")]),
+                E("span", "w2", C, vec![T("ws1", " ")]),
+            ],
+        )]);
+        let lc = layout_children(&doc, i["f"]);
+        assert_eq!(lc.len(), 2, "{lc:?}");
+        assert_eq!(anon_children(&doc, lc[0]), vec![i["a"], i["sp"], i["b"]]);
+        assert_eq!(lc[1], i["d"]);
+        assert_live(&doc, 0);
+    }
+
     #[test]
     fn c10_list_items_inside_a_wrapper_are_numbered_by_the_list() {
         let (doc, i) = resolved(vec![E(
@@ -1586,6 +1641,109 @@ mod contents_tests {
         ]);
         assert_live(&doc, 0);
         assert!(doc.nodes.contains(i["r"]));
+    }
+
+    fn inline_text(doc: &BaseDocument, id: usize) -> String {
+        doc.nodes[id]
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .map(|layout| layout.text.clone())
+            .unwrap_or_default()
+    }
+
+    /// The ids of the brushes of the glyph runs of an inline layout, in order.
+    fn brush_ids(doc: &BaseDocument, id: usize) -> Vec<usize> {
+        let layout = doc.nodes[id]
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .unwrap();
+        let mut ids = Vec::new();
+        for line in layout.layout.lines() {
+            for item in line.items() {
+                if let parley::PositionedLayoutItem::GlyphRun(run) = item {
+                    ids.push(run.style().brush.id);
+                }
+            }
+        }
+        ids
+    }
+
+    /// A wrapper that changes nothing for the text adds no span, so the whitespace around it collapses as if it
+    /// were not there (a span would trim the space at its end).
+    #[test]
+    fn a_transparent_wrapper_does_not_change_the_text() {
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                T("a", "a "),
+                E(
+                    "span",
+                    "s",
+                    C,
+                    vec![T("b", "b "), E("i", "i", "", vec![T("c", "c")])],
+                ),
+                T("d", " d"),
+                E("p", "e", "", vec![T("te", "e")]),
+            ],
+        )]);
+        let anon = layout_children(&doc, i["o"])[0];
+        assert_eq!(inline_text(&doc, anon), "a b c d");
+        // The same through an inline root (no block sibling).
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                T("a", "a "),
+                E(
+                    "span",
+                    "s",
+                    C,
+                    vec![T("b", "b "), E("i", "i", "", vec![T("c", "c")])],
+                ),
+                T("d", " d"),
+            ],
+        )]);
+        assert_eq!(inline_text(&doc, i["o"]), "a b c d");
+    }
+
+    /// A wrapper that sets its own style is a span: the text inside it takes the wrapper's brush, in an anonymous
+    /// block and in an inline root, however deep the wrappers are nested.
+    #[test]
+    fn a_styled_wrapper_gives_its_text_its_own_brush() {
+        let red = "display:contents;color:red";
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                T("a", "a"),
+                E(
+                    "span",
+                    "w1",
+                    C,
+                    vec![E("span", "w2", red, vec![T("b", "b")])],
+                ),
+                E("p", "e", "", vec![T("te", "e")]),
+            ],
+        )]);
+        let anon = layout_children(&doc, i["o"])[0];
+        let brushes = brush_ids(&doc, anon);
+        assert_eq!(brushes.len(), 2, "{brushes:?}");
+        assert_ne!(brushes[0], i["w2"]);
+        assert_eq!(brushes[1], i["w2"]);
+
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![T("a", "a"), E("span", "w2", red, vec![T("b", "b")])],
+        )]);
+        let brushes = brush_ids(&doc, i["o"]);
+        assert_eq!(brushes.len(), 2, "{brushes:?}");
+        assert_eq!(brushes[1], i["w2"]);
     }
 
     #[test]
