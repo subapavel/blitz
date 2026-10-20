@@ -143,11 +143,13 @@ fn compute_node_layout(
         NodeData::Text(data) => {
             // With the new "inline context" architecture all text nodes should be wrapped in an "inline layout context"
             // and should therefore never be measured individually.
-            println!(
-                "ERROR: Tried to lay out text node individually ({})",
+            // Layout hides the node, so its text is not drawn: a warning (it does not fire for any fixture or
+            // corpus document of html-to-pdf).
+            log::warn!(
+                "Tried to lay out text node individually ({}); the node is hidden",
                 usize::from(node_id)
             );
-            dbg!(data);
+            log::debug!("text node data: {data:?}");
             taffy::LayoutOutput::HIDDEN
             // unreachable!();
 

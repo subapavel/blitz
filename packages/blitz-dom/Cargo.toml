@@ -66,6 +66,8 @@ slab = { workspace = true }
 bitflags = { workspace = true }
 tracing = { workspace = true, optional = true }
 fastrand = { workspace = true }
+# Diagnostics go to `log`; a library never writes to stdout
+log = "0.4"
 rayon = { workspace = true }
 
 # Media & Decoding

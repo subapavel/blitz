@@ -779,7 +779,7 @@ fn table_part_of(node: &Node) -> TablePart {
         NodeData::Comment => TablePart::Whitespace,
         NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
             let Some(display) = node.primary_styles().map(|s| s.clone_display()) else {
-                println!("Ignoring table descendent because it has no styles");
+                log::debug!("Ignoring table descendent because it has no styles");
                 return TablePart::Hidden;
             };
             if display.outside() == DisplayOutside::None {

@@ -904,7 +904,7 @@ impl BaseDocument {
             .first_element_child()
             .is_none()
         {
-            println!("No DOM - not resolving");
+            log::debug!("No DOM - not resolving");
             return;
         }
 

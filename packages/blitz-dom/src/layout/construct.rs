@@ -189,9 +189,10 @@ pub(crate) fn collect_layout_children(
                         .special_data = SpecialElementData::Image(Box::new(svg.into()));
                 }
                 Err(err) => {
-                    println!("{container_node_id} SVG parse failed");
-                    println!("{outer_html}");
-                    dbg!(err);
+                    // The SVG is dropped: content the author wrote is lost, so this is a warning. The markup can
+                    // be large; it is only at `debug`.
+                    log::warn!("inline SVG (node {container_node_id}) is not rendered: {err}");
+                    log::debug!("rejected SVG (node {container_node_id}): {outer_html}");
                 }
             };
             return;
@@ -1058,4 +1059,75 @@ fn is_combining_mark(c: char) -> bool {
             | '\u{1DC0}'..='\u{1DFF}'
             | '\u{20D0}'..='\u{20FF}'
             | '\u{FE20}'..='\u{FE2F}')
+}
+
+#[cfg(all(test, feature = "svg"))]
+mod svg_log_tests {
+    use std::sync::Mutex;
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, ns};
+
+    static RECORDS: Mutex<Vec<(log::Level, String, String)>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record<'_>) {
+            RECORDS
+                .lock()
+                .unwrap()
+                .push((r.level(), r.target().to_string(), r.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    fn html_el(name: &str) -> QualName {
+        QualName::new(None, ns!(html), name.into())
+    }
+
+    /// An inline `<svg>` that usvg rejects is dropped with one `warn` record (the markup only at `debug`), and
+    /// nothing is written to stdout. One test only: the logger is global to the process.
+    #[test]
+    fn a_rejected_inline_svg_is_a_warning() {
+        log::set_logger(&Capture).unwrap();
+        log::set_max_level(log::LevelFilter::Debug);
+
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        {
+            let mut m = doc.mutate();
+            let html = m.create_element(html_el("html"), vec![]);
+            let body = m.create_element(html_el("body"), vec![]);
+            let attr = |name: &str, value: &str| Attribute {
+                name: QualName::new(None, ns!(), name.into()),
+                value: value.to_string(),
+            };
+            // A zero size is `usvg::Error::InvalidSize`.
+            let svg = m.create_element(
+                QualName::new(None, ns!(svg), "svg".into()),
+                vec![attr("width", "0"), attr("height", "0")],
+            );
+            m.append_children(0, &[html]);
+            m.append_children(html, &[body]);
+            m.append_children(body, &[svg]);
+        }
+        doc.resolve(0.0);
+
+        let records = std::mem::take(&mut *RECORDS.lock().unwrap());
+        let warns: Vec<_> = records
+            .iter()
+            .filter(|(l, ..)| *l == log::Level::Warn)
+            .collect();
+        assert_eq!(warns.len(), 1, "{records:?}");
+        assert!(warns[0].2.contains("inline SVG"), "{warns:?}");
+        assert!(warns[0].1.starts_with("blitz_dom"), "{warns:?}");
+        assert!(
+            records
+                .iter()
+                .any(|(l, _, m)| *l == log::Level::Debug && m.contains("<svg")),
+            "{records:?}"
+        );
+    }
 }
