@@ -145,8 +145,11 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
         Self: 'a;
 
     fn finish(self) -> Self::Output {
+        // A library must not write to stdout. Parse errors are diagnostics (HTML LS 13.2.2: recovery is fully
+        // defined and reporting is optional), so they are `debug` records. With `exact_errors: false` the message
+        // carries neither token nor position, so a warning would not tell the author what to fix.
         for error in self.errors.borrow().iter() {
-            println!("ERROR: {error}");
+            log::debug!("html parse error: {error}");
         }
     }
 
@@ -294,4 +297,62 @@ fn parses_some_html() {
     doc.print_tree()
 
     // Now our tree should have some nodes in it
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use blitz_dom::DocumentConfig;
+
+    use crate::HtmlDocument;
+
+    static RECORDS: Mutex<Vec<(log::Level, String, String)>> = Mutex::new(Vec::new());
+
+    struct Capture;
+
+    impl log::Log for Capture {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, r: &log::Record<'_>) {
+            RECORDS
+                .lock()
+                .unwrap()
+                .push((r.level(), r.target().to_string(), r.args().to_string()));
+        }
+        fn flush(&self) {}
+    }
+
+    /// Parse errors are `debug` records of this crate (one per error); `finish` writes nothing to stdout.
+    /// One test only: the logger is global to the process.
+    #[test]
+    fn parse_errors_go_to_log() {
+        log::set_logger(&Capture).unwrap();
+        log::set_max_level(log::LevelFilter::Debug);
+
+        // No doctype: "Unexpected token" (a quirks-mode parse).
+        let _ = HtmlDocument::from_html("<p>x</p>", DocumentConfig::default());
+        let records = std::mem::take(&mut *RECORDS.lock().unwrap());
+        let errors: Vec<_> = records
+            .iter()
+            .filter(|(_, t, m)| t.starts_with("blitz_html") && m.contains("Unexpected token"))
+            .collect();
+        assert!(!errors.is_empty(), "{records:?}");
+        assert!(
+            errors.iter().all(|(l, ..)| *l == log::Level::Debug),
+            "{errors:?}"
+        );
+
+        // A conforming document reports nothing.
+        let _ = HtmlDocument::from_html(
+            "<!doctype html><title>t</title><p>x</p>",
+            DocumentConfig::default(),
+        );
+        let records = std::mem::take(&mut *RECORDS.lock().unwrap());
+        assert!(
+            records.iter().all(|(_, t, _)| !t.starts_with("blitz_html")),
+            "{records:?}"
+        );
+    }
 }
