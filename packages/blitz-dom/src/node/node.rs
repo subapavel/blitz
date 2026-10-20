@@ -198,6 +198,18 @@ impl Node {
         let style = self.primary_styles();
         let style = style.as_ref();
 
+        // A `display: contents` element generates no box: it contains a block when its children do, whatever
+        // its own `position` says (css-display-3 §2.5).
+        if let Some(display) = style.map(|s| s.clone_display()) {
+            if display.inside() == DisplayInside::Contents {
+                return self
+                    .children
+                    .iter()
+                    .copied()
+                    .any(|child_id| self.tree()[child_id].is_or_contains_block());
+            }
+        }
+
         // Ignore out-of-flow items
         let position = style
             .map(|s| s.clone_position())

@@ -2,6 +2,7 @@ use markup5ever::local_name;
 use parley::FontStack;
 use style::computed_values::list_style_position::T as ListStylePosition;
 use style::computed_values::list_style_type::T as ListStyleType;
+use style::values::specified::box_::DisplayInside;
 
 use crate::{
     BaseDocument,
@@ -30,6 +31,14 @@ pub(super) fn collect_list_item_children(
             let node = &mut doc.nodes[child];
             if let Some(element_data) = node.element_data_mut() {
                 element_data.list_item_data = None;
+            }
+            // A `display: contents` element generates no box: its list items are items of this list and
+            // continue its numbering.
+            if doc.nodes[child]
+                .display_style()
+                .is_some_and(|display| display.inside() == DisplayInside::Contents)
+            {
+                collect_list_item_children(doc, index, reversed, child);
             }
         }
     }

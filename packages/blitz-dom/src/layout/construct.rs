@@ -230,52 +230,24 @@ pub(crate) fn collect_layout_children(
     match container_display.inside() {
         DisplayInside::None => {}
         DisplayInside::Contents => {
+            // Only reached by defensive paths (the root is blockified): the element generates no box and
+            // its children take its place.
             doc.nodes[container_node_id]
                 .remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
-            // Take children array from node to avoid borrow checker issues.
-            let children = std::mem::take(&mut doc.nodes[container_node_id].children);
-
-            for child_id in children.iter().copied() {
-                collect_layout_children(doc, child_id, layout_children, anonymous_block_id)
-            }
-
-            // Put children array back
-            doc.nodes[container_node_id].children = children;
+            let flat = flattened_box_children(doc, container_node_id, true);
+            layout_children.extend_from_slice(&flat);
         }
         DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::TableCell => {
-            // TODO: make "all_inline" detection work in the presence of display:contents nodes
-            let mut all_block = true;
-            let mut all_inline = true;
-            let mut has_contents = false;
-            for child in doc.nodes[container_node_id]
-                .children
-                .iter()
-                .copied()
-                .map(|child_id| &doc.nodes[child_id])
-            {
-                // Unwraps on Text and SVG nodes
-                let display = child.display_style().unwrap_or(Display::inline());
-                if matches!(display.inside(), DisplayInside::Contents) {
-                    has_contents = true;
-                } else {
-                    match display.outside() {
-                        DisplayOutside::None => {}
-                        DisplayOutside::Block
-                        | DisplayOutside::TableCaption
-                        | DisplayOutside::InternalTable => all_inline = false,
-                        DisplayOutside::Inline => {
-                            all_block = false;
+            // `display: contents` children generate no box: their children (and pseudo-elements) take part
+            // in the classification as if they were children of this container (css-display-3 §2.5).
+            let has_contents = has_contents_child(doc, container_node_id);
+            let (all_block, all_inline) = if has_contents {
+                let flat = flattened_box_children(doc, container_node_id, false);
+                classify_children(doc, &flat)
+            } else {
+                classify_children(doc, &doc.nodes[container_node_id].children)
+            };
 
-                            // We need the "complex" tree fixing when an inline contains a block
-                            if child.is_or_contains_block() {
-                                all_inline = false;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // TODO: fix display:contents
             if all_inline {
                 let existing_layout = doc.nodes[container_node_id]
                     .element_data_mut()
@@ -370,9 +342,85 @@ pub(crate) fn collect_layout_children(
         }
 
         _ => {
-            push_children_and_pseudos(layout_children, &doc.nodes[container_node_id]);
+            if has_contents_child(doc, container_node_id) {
+                let flat = flattened_box_children(doc, container_node_id, true);
+                layout_children.extend_from_slice(&flat);
+            } else {
+                push_children_and_pseudos(layout_children, &doc.nodes[container_node_id]);
+            }
         }
     }
+}
+
+/// Whether any child of `node_id` is a `display: contents` element.
+fn has_contents_child(doc: &BaseDocument, node_id: usize) -> bool {
+    doc.nodes[node_id].children.iter().any(|&child_id| {
+        doc.nodes[child_id]
+            .display_style()
+            .is_some_and(|display| display.inside() == DisplayInside::Contents)
+    })
+}
+
+/// The children of `node_id` that generate boxes, with every `display: contents` element replaced by its own
+/// `::before`, children and `::after` (recursively, css-display-3 §2.5). The pseudo-elements of the contents
+/// elements are created or refreshed on the way. The pseudo-elements of `node_id` itself are included when
+/// `with_own_pseudos` is set (the caller has flushed them).
+fn flattened_box_children(
+    doc: &mut BaseDocument,
+    node_id: usize,
+    with_own_pseudos: bool,
+) -> Vec<usize> {
+    fn flatten(doc: &mut BaseDocument, node_id: usize, with_pseudos: bool, out: &mut Vec<usize>) {
+        if with_pseudos {
+            out.extend(doc.nodes[node_id].before);
+        }
+        for i in 0..doc.nodes[node_id].children.len() {
+            let child_id = doc.nodes[node_id].children[i];
+            let is_contents = doc.nodes[child_id]
+                .display_style()
+                .is_some_and(|display| display.inside() == DisplayInside::Contents);
+            if is_contents {
+                flush_pseudo_elements(doc, child_id);
+                doc.nodes[child_id]
+                    .remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
+                flatten(doc, child_id, true, out);
+            } else {
+                out.push(child_id);
+            }
+        }
+        if with_pseudos {
+            out.extend(doc.nodes[node_id].after);
+        }
+    }
+
+    let mut out = Vec::new();
+    flatten(doc, node_id, with_own_pseudos, &mut out);
+    out
+}
+
+/// `(all_block, all_inline)` for the box-generating children `ids` of a block container.
+fn classify_children(doc: &BaseDocument, ids: &[usize]) -> (bool, bool) {
+    let mut all_block = true;
+    let mut all_inline = true;
+    for child in ids.iter().map(|&child_id| &doc.nodes[child_id]) {
+        // Unwraps on Text and SVG nodes
+        let display = child.display_style().unwrap_or(Display::inline());
+        match display.outside() {
+            DisplayOutside::None => {}
+            DisplayOutside::Block
+            | DisplayOutside::TableCaption
+            | DisplayOutside::InternalTable => all_inline = false,
+            DisplayOutside::Inline => {
+                all_block = false;
+
+                // We need the "complex" tree fixing when an inline contains a block
+                if child.is_or_contains_block() {
+                    all_inline = false;
+                }
+            }
+        }
+    }
+    (all_block, all_inline)
 }
 
 fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: usize) {
@@ -468,55 +516,121 @@ fn collect_complex_layout_children(
     hide_whitespace: bool,
     needs_wrap: impl Fn(NodeKind, DisplayOutside) -> bool,
 ) {
-    fn block_is_only_whitespace(doc: &BaseDocument, node_id: usize) -> bool {
-        for child_id in doc.nodes[node_id].children.iter().copied() {
-            let child = &doc.nodes[child_id];
-            if child
-                .text_data()
-                .is_none_or(|text_data| !text_data.content.chars().all(|c| c.is_ascii_whitespace()))
-            {
-                return false;
-            }
-        }
+    doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
+        place_box_child(
+            doc,
+            container_node_id,
+            child_id,
+            layout_children,
+            anonymous_block_id,
+            hide_whitespace,
+            &needs_wrap,
+        );
+    });
 
-        true
+    // If anonymous block node only contains whitespace then delete it
+    close_anonymous_block(doc, layout_children, anonymous_block_id);
+}
+
+fn block_is_only_whitespace(doc: &BaseDocument, node_id: usize) -> bool {
+    for child_id in doc.nodes[node_id].children.iter().copied() {
+        let child = &doc.nodes[child_id];
+        if child
+            .text_data()
+            .is_none_or(|text_data| !text_data.content.chars().all(|c| c.is_ascii_whitespace()))
+        {
+            return false;
+        }
     }
 
-    doc.iter_children_and_pseudos_mut(container_node_id, |child_id, doc| {
-        // Get node kind (text, element, comment, etc)
-        let child_node_kind = doc.nodes[child_id].data.kind();
+    true
+}
 
-        // Get Display style. Default to inline because nodes without styles are probably text nodes
-        let contains_block = doc.nodes[child_id].is_or_contains_block();
-        let child_display = &doc.nodes[child_id]
-            .display_style()
-            .unwrap_or(Display::inline());
-        let display_inside = child_display.inside();
-        let display_outside = if contains_block {
+/// Closes the open anonymous block, if any. A block that holds only whitespace generates no box and is freed.
+///
+/// The open block is always the last entry of `layout_children`: every push of a box first closes it. It is
+/// removed by identity all the same, so a broken invariant cannot free a block that is still listed or drop another
+/// child (F150).
+fn close_anonymous_block(
+    doc: &mut BaseDocument,
+    layout_children: &mut Vec<usize>,
+    anonymous_block_id: &mut Option<usize>,
+) {
+    if let Some(anon_id) = anonymous_block_id.take() {
+        if block_is_only_whitespace(doc, anon_id) {
+            let position = layout_children.iter().rposition(|&id| id == anon_id);
+            debug_assert_eq!(
+                position,
+                layout_children.len().checked_sub(1),
+                "the open anonymous block must be the last layout child"
+            );
+            if let Some(position) = position {
+                layout_children.remove(position);
+            }
+            doc.nodes.remove(anon_id);
+        }
+    }
+}
+
+/// Places one child (or pseudo-element) of a block, flex or grid container: wraps it in the open anonymous block,
+/// or closes that block and pushes the child. A `display: contents` child generates no box; its `::before`,
+/// children and `::after` are placed the same way, as if they were children of the container (css-display-3 §2.5),
+/// so every push goes through here and the open anonymous block stays the last layout child.
+fn place_box_child(
+    doc: &mut BaseDocument,
+    container_node_id: usize,
+    child_id: usize,
+    layout_children: &mut Vec<usize>,
+    anonymous_block_id: &mut Option<usize>,
+    hide_whitespace: bool,
+    needs_wrap: &dyn Fn(NodeKind, DisplayOutside) -> bool,
+) {
+    // Get node kind (text, element, comment, etc)
+    let child_node_kind = doc.nodes[child_id].data.kind();
+
+    // Get Display style. Default to inline because nodes without styles are probably text nodes
+    let child_display = doc.nodes[child_id]
+        .display_style()
+        .unwrap_or(Display::inline());
+    let display_inside = child_display.inside();
+
+    let is_whitespace_node = match &doc.nodes[child_id].data {
+        NodeData::Text(data) => data.content.chars().all(|c| c.is_ascii_whitespace()),
+        _ => false,
+    };
+
+    // Skip comment nodes. Note that we do *not* skip `Display::None` nodes as they may need to be hidden.
+    // Taffy knows how to deal with `Display::None` children.
+    //
+    // Also hide all-whitespace flexbox children as these should be ignored
+    if child_node_kind == NodeKind::Comment || (hide_whitespace && is_whitespace_node) {
+        // return;
+    }
+    // A `display: contents` node is replaced by its pseudo-elements and children
+    else if display_inside == DisplayInside::Contents {
+        flush_pseudo_elements(doc, child_id);
+        doc.nodes[child_id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
+        doc.iter_children_and_pseudos_mut(child_id, |grandchild_id, doc| {
+            place_box_child(
+                doc,
+                container_node_id,
+                grandchild_id,
+                layout_children,
+                anonymous_block_id,
+                hide_whitespace,
+                needs_wrap,
+            );
+        });
+    } else {
+        let display_outside = if doc.nodes[child_id].is_or_contains_block() {
             DisplayOutside::Block
         } else {
             child_display.outside()
         };
 
-        let is_whitespace_node = match &doc.nodes[child_id].data {
-            NodeData::Text(data) => data.content.chars().all(|c| c.is_ascii_whitespace()),
-            _ => false,
-        };
-
-        // Skip comment nodes. Note that we do *not* skip `Display::None` nodes as they may need to be hidden.
-        // Taffy knows how to deal with `Display::None` children.
-        //
-        // Also hide all-whitespace flexbox children as these should be ignored
-        if child_node_kind == NodeKind::Comment || (hide_whitespace && is_whitespace_node) {
-            // return;
-        }
-        // Recurse into `Display::Contents` nodes
-        else if display_inside == DisplayInside::Contents {
-            collect_layout_children(doc, child_id, layout_children, anonymous_block_id)
-        }
         // Push nodes that need wrapping into the current "anonymous block container".
         // If there is not an open one then we create one.
-        else if needs_wrap(child_node_kind, display_outside) {
+        if needs_wrap(child_node_kind, display_outside) {
             if anonymous_block_id.is_none() {
                 let node_id = create_anonymous_block(doc, container_node_id);
                 layout_children.push(node_id);
@@ -529,26 +643,8 @@ fn collect_complex_layout_children(
         }
         // Else push the child directly (and close any open "anonymous block container")
         else {
-            // If anonymous block node only contains whitespace then delete it
-            if let Some(anon_id) = *anonymous_block_id {
-                if block_is_only_whitespace(doc, anon_id) {
-                    layout_children.pop();
-                    doc.nodes.remove(anon_id);
-                    *anonymous_block_id = None;
-                }
-            }
-
-            *anonymous_block_id = None;
+            close_anonymous_block(doc, layout_children, anonymous_block_id);
             layout_children.push(child_id);
-        }
-    });
-
-    // If anonymous block node only contains whitespace then delete it
-    if let Some(anon_id) = *anonymous_block_id {
-        if block_is_only_whitespace(doc, anon_id) {
-            layout_children.pop();
-            doc.nodes.remove(anon_id);
-            *anonymous_block_id = None;
         }
     }
 }
@@ -669,11 +765,15 @@ pub(crate) fn find_inline_layout_embedded_boxes(
             let display = doc.nodes[node_id]
                 .display_style()
                 .unwrap_or(Display::inline());
-            let do_recurse = match (display.outside(), display.inside()) {
-                (DisplayOutside::None, DisplayInside::Contents) => true,
-                (DisplayOutside::Inline, DisplayInside::Flow) => true,
-                (_, _) => false,
-            };
+            let child_is_contents = doc.nodes[child_id]
+                .display_style()
+                .is_some_and(|d| d.inside() == DisplayInside::Contents);
+            let do_recurse = child_is_contents
+                || match (display.outside(), display.inside()) {
+                    (DisplayOutside::None, DisplayInside::Contents) => true,
+                    (DisplayOutside::Inline, DisplayInside::Flow) => true,
+                    (_, _) => false,
+                };
             if do_recurse {
                 flush_inline_pseudos_recursive(doc, child_id);
             }
@@ -707,8 +807,15 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                         node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                     }
                     (DisplayOutside::None, DisplayInside::Contents) => {
-                        for child_id in node.children.iter().copied() {
-                            node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                        node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                        // The element generates no box; its pseudo-elements and children take its place.
+                        let before = node.before;
+                        let after = node.after;
+                        for child_id in before
+                            .into_iter()
+                            .chain(node.children.iter().copied())
+                            .chain(after)
+                        {
                             find_inline_layout_embedded_boxes_recursive(
                                 nodes,
                                 parent_id,
@@ -837,10 +944,10 @@ pub(crate) fn build_inline_layout_into(
         );
     }
     for child_id in root_node.children.iter().copied() {
-        build_inline_layout_recursive(
+        build_root_child(
             &mut builder,
             nodes,
-            inline_context_root_node_id,
+            root_node,
             child_id,
             collapse_mode,
             root_line_height,
@@ -859,6 +966,80 @@ pub(crate) fn build_inline_layout_into(
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
     return;
+
+    /// Builds a child of the inline root. The children of an anonymous block can come from inside
+    /// `display: contents` elements (they generate no box, so their children were placed in the block): each of
+    /// those elements is entered as a style span so that the text keeps the style and the brush of its own
+    /// parent and not those of the block.
+    fn build_root_child(
+        builder: &mut TreeBuilder<TextBrush>,
+        nodes: &Slab<Node>,
+        root_node: &Node,
+        child_id: usize,
+        collapse_mode: WhiteSpaceCollapse,
+        root_line_height: f32,
+    ) {
+        let mut wrappers: smallvec::SmallVec<[usize; 4]> = smallvec::SmallVec::new();
+        if root_node.data.kind() == NodeKind::AnonymousBlock {
+            let mut parent = nodes[child_id].parent;
+            while let Some(parent_id) = parent {
+                if parent_id == root_node.id || Some(parent_id) == root_node.parent {
+                    break;
+                }
+                let is_contents = nodes[parent_id]
+                    .display_style()
+                    .is_some_and(|d| d.inside() == DisplayInside::Contents);
+                if !is_contents {
+                    break;
+                }
+                wrappers.push(parent_id);
+                parent = nodes[parent_id].parent;
+            }
+        }
+
+        // Outermost first.
+        let mut collapse_mode = collapse_mode;
+        for &wrapper_id in wrappers.iter().rev() {
+            let wrapper = &nodes[wrapper_id];
+            builder.push_style_span(inline_span_style(wrapper, root_line_height));
+            if let Some(style) = wrapper.primary_styles() {
+                collapse_mode = stylo_to_parley::white_space_collapse(
+                    style.get_inherited_text().white_space_collapse,
+                );
+            }
+        }
+        build_inline_layout_recursive(
+            builder,
+            nodes,
+            root_node.id,
+            child_id,
+            collapse_mode,
+            root_line_height,
+        );
+        for _ in &wrappers {
+            builder.pop_style_span();
+        }
+    }
+
+    /// The Parley style of the span of an inline element (or `display: contents` element).
+    fn inline_span_style(
+        node: &Node,
+        root_line_height: f32,
+    ) -> parley::TextStyle<'static, TextBrush> {
+        let mut style = node
+            .primary_styles()
+            .map(|s| stylo_to_parley::style(node.id, &s))
+            .unwrap_or_default();
+
+        let font_size = style.font_size;
+
+        // Floor the line-height of the span by the line-height of the inline context
+        // See https://www.w3.org/TR/CSS21/visudet.html#line-height
+        style.line_height = parley::LineHeight::Absolute(
+            resolve_line_height(style.line_height, font_size).max(root_line_height),
+        );
+        style
+    }
 
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
@@ -897,8 +1078,15 @@ pub(crate) fn build_inline_layout_into(
                         // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                     }
                     (DisplayOutside::None, DisplayInside::Contents) => {
-                        for child_id in node.children.iter().copied() {
-                            // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                        // The element generates no box, but its text style is inherited by its children and
+                        // its brush identifies them (colour, decoration, link) in the paint.
+                        builder.push_style_span(inline_span_style(node, root_line_height));
+                        for child_id in node
+                            .before
+                            .into_iter()
+                            .chain(node.children.iter().copied())
+                            .chain(node.after)
+                        {
                             build_inline_layout_recursive(
                                 builder,
                                 nodes,
@@ -908,6 +1096,7 @@ pub(crate) fn build_inline_layout_into(
                                 root_line_height,
                             );
                         }
+                        builder.pop_style_span();
                     }
                     (DisplayOutside::Inline, DisplayInside::Flow) => {
                         let tag_name = &element_data.name.local;
@@ -932,24 +1121,7 @@ pub(crate) fn build_inline_layout_into(
                             push_forced_break(builder, collapse_mode);
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                            let mut style = node
-                                .primary_styles()
-                                .map(|s| stylo_to_parley::style(node.id, &s))
-                                .unwrap_or_default();
-
-                            // dbg!(&style);
-
-                            let font_size = style.font_size;
-
-                            // Floor the line-height of the span by the line-height of the inline context
-                            // See https://www.w3.org/TR/CSS21/visudet.html#line-height
-                            style.line_height = parley::LineHeight::Absolute(
-                                resolve_line_height(style.line_height, font_size)
-                                    .max(root_line_height),
-                            );
-
-                            // dbg!(node_id);
-                            // dbg!(&style);
+                            let style = inline_span_style(node, root_line_height);
 
                             builder.push_style_span(style);
 
@@ -1129,5 +1301,322 @@ mod svg_log_tests {
                 .any(|(l, _, m)| *l == log::Level::Debug && m.contains("<svg")),
             "{records:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod contents_tests {
+    use std::collections::HashMap;
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, ns};
+
+    /// A tiny tree description: an element with an `id`, a `style` attribute and children, or a text node with a
+    /// name.
+    enum N {
+        E(&'static str, &'static str, &'static str, Vec<N>),
+        T(&'static str, &'static str),
+    }
+    use N::{E, T};
+
+    const C: &str = "display:contents";
+
+    fn build(
+        m: &mut crate::DocumentMutator<'_>,
+        n: &N,
+        ids: &mut HashMap<&'static str, usize>,
+    ) -> usize {
+        match n {
+            T(name, text) => {
+                let id = m.create_text_node(text);
+                ids.insert(name, id);
+                id
+            }
+            E(tag, name, style, kids) => {
+                let attr = |n: &str, v: &str| Attribute {
+                    name: QualName::new(None, ns!(), n.into()),
+                    value: v.to_string(),
+                };
+                let mut attrs = vec![attr("id", name)];
+                if !style.is_empty() {
+                    attrs.push(attr("style", style));
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert(name, id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// Resolves `<html><body>{body}</body></html>` and returns the document and the ids by name.
+    fn resolved(body: Vec<N>) -> (BaseDocument, HashMap<&'static str, usize>) {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E("html", "html", "", vec![E("body", "body", "", body)]),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    fn layout_children(doc: &BaseDocument, id: usize) -> Vec<usize> {
+        doc.nodes[id]
+            .layout_children
+            .borrow()
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Every layout child, recursively, is a live node and has its parent as `layout_parent`.
+    fn assert_live(doc: &BaseDocument, id: usize) {
+        for child in layout_children(doc, id) {
+            assert!(
+                doc.nodes.contains(child),
+                "node {id} lists freed node {child}"
+            );
+            assert_eq!(doc.nodes[child].layout_parent.get(), Some(id));
+            assert_live(doc, child);
+        }
+    }
+
+    fn anon_children(doc: &BaseDocument, id: usize) -> Vec<usize> {
+        doc.nodes[id].children.clone()
+    }
+
+    fn p(name: &'static str, text_name: &'static str, text: &'static str) -> N {
+        E("p", name, "", vec![T(text_name, text)])
+    }
+
+    #[test]
+    fn c1_blocks_with_inline_content_are_placed() {
+        let (doc, i) = resolved(vec![
+            E(
+                "div",
+                "w",
+                C,
+                vec![p("p1", "t1", "Faktura"), p("p2", "t2", "Celkem")],
+            ),
+            p("end", "t3", "end"),
+        ]);
+        assert_eq!(
+            layout_children(&doc, i["body"]),
+            vec![i["p1"], i["p2"], i["end"]]
+        );
+        for name in ["p1", "p2", "end"] {
+            assert_eq!(
+                layout_children(&doc, i[name]),
+                Vec::<usize>::new(),
+                "{name}"
+            );
+            assert!(
+                doc.nodes[i[name]].flags.is_inline_root(),
+                "{name} is an inline root"
+            );
+        }
+        assert_live(&doc, 0);
+    }
+
+    #[test]
+    fn c2_contents_after_a_block() {
+        let (doc, i) = resolved(vec![
+            p("start", "t0", "start"),
+            E(
+                "div",
+                "w",
+                C,
+                vec![p("p1", "t1", "Faktura"), p("p2", "t2", "Celkem")],
+            ),
+        ]);
+        assert_eq!(
+            layout_children(&doc, i["body"]),
+            vec![i["start"], i["p1"], i["p2"]]
+        );
+        assert_live(&doc, 0);
+    }
+
+    #[test]
+    fn c3_inline_content_of_a_wrapper_joins_one_anonymous_block() {
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                E(
+                    "div",
+                    "w",
+                    C,
+                    vec![
+                        E("span", "s", "", vec![T("t1", "Faktura")]),
+                        T("sp", " "),
+                        E("b", "b", "", vec![T("t2", "Celkem")]),
+                    ],
+                ),
+                p("y", "t3", "y"),
+            ],
+        )]);
+        let lc = layout_children(&doc, i["o"]);
+        assert_eq!(lc.len(), 2, "{lc:?}");
+        assert_eq!(lc[1], i["y"]);
+        assert_eq!(anon_children(&doc, lc[0]), vec![i["s"], i["sp"], i["b"]]);
+        assert_live(&doc, 0);
+    }
+
+    #[test]
+    fn c4_a_run_of_inline_content_crosses_the_boundary() {
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                T("a", "a "),
+                E(
+                    "span",
+                    "s",
+                    C,
+                    vec![T("b", "b "), E("i", "i", "", vec![T("c", "c")])],
+                ),
+                T("d", " d"),
+                p("e", "te", "e"),
+            ],
+        )]);
+        let lc = layout_children(&doc, i["o"]);
+        assert_eq!(lc.len(), 2, "{lc:?}");
+        assert_eq!(lc[1], i["e"]);
+        assert_eq!(
+            anon_children(&doc, lc[0]),
+            vec![i["a"], i["b"], i["i"], i["d"]]
+        );
+        assert_live(&doc, 0);
+    }
+
+    #[test]
+    fn c7_flex_items_and_text_through_a_wrapper() {
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "f",
+            "display:flex",
+            vec![
+                E(
+                    "div",
+                    "w",
+                    C,
+                    vec![
+                        E("div", "i1", "", vec![T("t1", "1")]),
+                        E("div", "i2", "", vec![T("t2", "2")]),
+                    ],
+                ),
+                T("tx", "text"),
+                E("div", "i3", "", vec![T("t3", "3")]),
+            ],
+        )]);
+        let lc = layout_children(&doc, i["f"]);
+        assert_eq!(lc.len(), 4, "{lc:?}");
+        assert_eq!((lc[0], lc[1], lc[3]), (i["i1"], i["i2"], i["i3"]));
+        assert_eq!(anon_children(&doc, lc[2]), vec![i["tx"]]);
+        assert_live(&doc, 0);
+    }
+
+    #[test]
+    fn c10_list_items_inside_a_wrapper_are_numbered_by_the_list() {
+        let (doc, i) = resolved(vec![E(
+            "ol",
+            "ol",
+            "",
+            vec![
+                E(
+                    "div",
+                    "w",
+                    C,
+                    vec![
+                        E("li", "a", "", vec![T("t1", "a")]),
+                        E("li", "b", "", vec![T("t2", "b")]),
+                    ],
+                ),
+                E("li", "c", "", vec![T("t3", "c")]),
+            ],
+        )]);
+        assert_eq!(layout_children(&doc, i["ol"]), vec![i["a"], i["b"], i["c"]]);
+        for name in ["a", "b", "c"] {
+            let item = doc.nodes[i[name]]
+                .element_data()
+                .unwrap()
+                .list_item_data
+                .is_some();
+            assert!(item, "{name} has a marker");
+        }
+        assert_live(&doc, 0);
+    }
+
+    /// F150: a whitespace-only anonymous block followed by a contents element whose subtree pushes children.
+    #[test]
+    fn f150_whitespace_block_before_a_contents_subtree() {
+        let nested = || {
+            E(
+                "div",
+                "w",
+                C,
+                vec![E("div", "d", "", vec![E("p", "q", "", vec![])])],
+            )
+        };
+        // The end-of-loop cleanup.
+        let (doc, i) = resolved(vec![E("p", "p0", "", vec![]), T("ws", " "), nested()]);
+        assert_eq!(layout_children(&doc, i["body"]), vec![i["p0"], i["d"]]);
+        assert_live(&doc, 0);
+        // The cleanup before a block sibling.
+        let (doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![T("ws", " "), nested(), E("p", "p1", "", vec![])],
+        )]);
+        assert_eq!(layout_children(&doc, i["o"]), vec![i["d"], i["p1"]]);
+        assert_live(&doc, 0);
+        // An orphan table inside a wrapper.
+        let (doc, i) = resolved(vec![
+            E("p", "p0", "", vec![]),
+            T("ws", " "),
+            E("table", "t", C, vec![E("tr", "r", "", vec![])]),
+        ]);
+        assert_live(&doc, 0);
+        assert!(doc.nodes.contains(i["r"]));
+    }
+
+    #[test]
+    fn resolving_twice_gives_the_same_tree() {
+        let (mut doc, i) = resolved(vec![E(
+            "div",
+            "o",
+            "",
+            vec![
+                T("a", "a "),
+                E("span", "s", C, vec![T("b", "b "), p("p1", "tp", "x")]),
+                T("ws", " "),
+                E(
+                    "div",
+                    "w",
+                    C,
+                    vec![E("div", "d", "", vec![p("q", "tq", "q")])],
+                ),
+            ],
+        )]);
+        let first = layout_children(&doc, i["o"]);
+        let shape = |doc: &BaseDocument| {
+            let lc = layout_children(doc, i["o"]);
+            lc.iter()
+                .map(|&id| anon_children(doc, id).len())
+                .collect::<Vec<_>>()
+        };
+        let before = shape(&doc);
+        doc.resolve(0.0);
+        assert_live(&doc, 0);
+        assert_eq!(shape(&doc), before);
+        assert_eq!(layout_children(&doc, i["o"]).len(), first.len());
     }
 }
