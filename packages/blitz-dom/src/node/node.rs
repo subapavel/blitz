@@ -9,7 +9,7 @@ use selectors::matching::ElementSelectorFlags;
 use slab::Slab;
 use std::cell::{Cell, RefCell};
 use std::fmt::Write;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use style::Atom;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::properties::ComputedValues;
@@ -80,6 +80,10 @@ pub struct Node {
     pub parent: Option<usize>,
     // What are our children?
     pub children: Vec<usize>,
+    /// Where we were last seen in our parent's `children` (`u32::MAX`: not known). Only a hint for
+    /// [`Node::child_index`], which checks it on every read, so a stale one costs a scan and never a wrong answer.
+    /// Atomic, not a `Cell`, because the style traversal reads it from several threads (`Node` is `Sync`).
+    pub index_hint: AtomicU32,
     /// Our parent in the layout hierachy: a separate list that includes anonymous collections of inline elements
     pub layout_parent: Cell<Option<usize>>,
     /// A separate child list that includes anonymous collections of inline elements
@@ -141,6 +145,7 @@ impl Node {
             id,
             parent: None,
             children: vec![],
+            index_hint: AtomicU32::new(u32::MAX),
             layout_parent: Cell::new(None),
             layout_children: RefCell::new(None),
             paint_children: RefCell::new(None),
@@ -475,12 +480,37 @@ impl Node {
         self.children.iter().position(|id| *id == child_id)
     }
 
-    // Get the index of the current node in the parents child list
+    /// The index of this node in its parent's child list (`None` without a parent or when the parent does not list
+    /// it).
+    ///
+    /// Stylo asks for the siblings of an element through [`Node::forward`] and [`Node::backward`] for every rule with
+    /// `:first-child`, `:last-child` or `:nth-child`, so a plain `position` made one pass over a long parent (the
+    /// rows of a table) per element. The answer is read from `index_hint` and used when the parent's list still holds
+    /// this node there. Otherwise one pass over the list sets the hint of every sibling, so the next
+    /// `children.len() - 1` queries on this parent are answered from their hints (F99c).
+    ///
+    /// `children` is a public field that anything can change, so the hint is only ever a guess that is checked; a
+    /// node is listed once, so a checked hint is the same index `position` finds.
     pub fn child_index(&self) -> Option<usize> {
-        self.tree()[self.parent?]
-            .children
-            .iter()
-            .position(|id| *id == self.id)
+        let siblings = &self.tree()[self.parent?].children;
+        let hint = self.index_hint.load(Ordering::Relaxed) as usize;
+        if siblings.get(hint) == Some(&self.id) {
+            return Some(hint);
+        }
+        // Back to front, so that a node listed twice (which would be a bug) ends with its first index, as `position`
+        // answers.
+        let mut found = None;
+        for (index, id) in siblings.iter().enumerate().rev() {
+            if let Some(sibling) = self.tree().get(*id)
+                && let Ok(index_u32) = u32::try_from(index)
+            {
+                sibling.index_hint.store(index_u32, Ordering::Relaxed);
+            }
+            if *id == self.id {
+                found = Some(index);
+            }
+        }
+        found
     }
 
     // Get the nth node in the parents child list
@@ -854,5 +884,171 @@ impl std::fmt::Debug for Node {
             // .field("unrounded_layout", &self.unrounded_layout)
             // .field("final_layout", &self.final_layout)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod child_index_tests {
+    use crate::{BaseDocument, DocumentConfig, qual_name};
+    use std::sync::atomic::Ordering;
+
+    const CHILDREN: usize = 10_000;
+
+    fn position(doc: &BaseDocument, id: usize) -> Option<usize> {
+        let parent = doc.nodes[id].parent?;
+        doc.nodes[parent].children.iter().position(|c| *c == id)
+    }
+
+    fn assert_every_index_is_the_position(doc: &BaseDocument, parent: usize) {
+        for &id in &doc.nodes[parent].children {
+            assert_eq!(doc.nodes[id].child_index(), position(doc, id), "node {id}");
+        }
+    }
+
+    fn element(doc: &mut BaseDocument) -> usize {
+        doc.mutate().create_element(qual_name!("div", html), vec![])
+    }
+
+    /// A parent with `CHILDREN` children.
+    fn tree() -> (BaseDocument, usize) {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let parent = element(&mut doc);
+        let kids: Vec<usize> = (0..CHILDREN).map(|_| element(&mut doc)).collect();
+        doc.mutate().append_children(parent, &kids);
+        (doc, parent)
+    }
+
+    #[test]
+    fn child_index_is_the_position_after_append_insert_and_remove() {
+        let (mut doc, parent) = tree();
+        assert_every_index_is_the_position(&doc, parent);
+
+        // Insert in front of, in the middle of and after existing children: the later siblings move.
+        let anchor = doc.nodes[parent].children[CHILDREN / 2];
+        let new = [element(&mut doc), element(&mut doc), element(&mut doc)];
+        doc.mutate().insert_nodes_before(anchor, &new);
+        assert_eq!(doc.nodes[parent].children.len(), CHILDREN + 3);
+        assert_every_index_is_the_position(&doc, parent);
+        let first = doc.nodes[parent].children[0];
+        let front = element(&mut doc);
+        doc.mutate().insert_nodes_before(first, &[front]);
+        assert_every_index_is_the_position(&doc, parent);
+        let back = element(&mut doc);
+        doc.mutate().append_children(parent, &[back]);
+        assert_every_index_is_the_position(&doc, parent);
+
+        // Remove from the front, the middle and the end.
+        for pick in [0, doc.nodes[parent].children.len() / 2, 5000] {
+            let id = doc.nodes[parent].children[pick];
+            doc.mutate().remove_node(id);
+            assert_eq!(
+                doc.nodes[id].child_index(),
+                None,
+                "a removed node has no index"
+            );
+            assert_every_index_is_the_position(&doc, parent);
+        }
+        let last = *doc.nodes[parent].children.last().unwrap();
+        doc.mutate().remove_and_drop_node(last);
+        assert_every_index_is_the_position(&doc, parent);
+    }
+
+    #[test]
+    fn a_stale_hint_never_changes_the_result() {
+        let (mut doc, parent) = tree();
+        assert_every_index_is_the_position(&doc, parent);
+        // `children` is a public field: reorder it behind the hints' backs.
+        doc.nodes[parent].children.reverse();
+        assert_every_index_is_the_position(&doc, parent);
+        doc.nodes[parent].children.swap(3, 9000);
+        doc.nodes[parent].children.rotate_left(17);
+        assert_every_index_is_the_position(&doc, parent);
+        // A hint far out of range, and one that points at another child.
+        let (a, b) = (
+            doc.nodes[parent].children[10],
+            doc.nodes[parent].children[20],
+        );
+        doc.nodes[a]
+            .index_hint
+            .store(u32::MAX - 1, Ordering::Relaxed);
+        doc.nodes[b].index_hint.store(10, Ordering::Relaxed);
+        assert_eq!(doc.nodes[a].child_index(), Some(10));
+        assert_eq!(doc.nodes[b].child_index(), Some(20));
+        // A node moved to another parent.
+        let other = element(&mut doc);
+        doc.mutate().append_children(other, &[a]);
+        assert_eq!(doc.nodes[a].child_index(), Some(0));
+        assert_every_index_is_the_position(&doc, parent);
+    }
+
+    /// One scan serves every sibling: after the first query the rest are answered from their hints, so a walk over
+    /// all the children of a parent costs one pass, not one pass each.
+    #[test]
+    fn one_query_refreshes_the_hints_of_all_siblings() {
+        let (doc, parent) = tree();
+        let kids = doc.nodes[parent].children.clone();
+        assert_eq!(
+            doc.nodes[kids[CHILDREN - 1]].child_index(),
+            Some(CHILDREN - 1)
+        );
+        for (i, &id) in kids.iter().enumerate() {
+            assert_eq!(doc.nodes[id].index_hint.load(Ordering::Relaxed) as usize, i);
+        }
+    }
+
+    #[test]
+    fn forward_and_backward_agree_with_the_child_list() {
+        let (mut doc, parent) = tree();
+        let anchor = doc.nodes[parent].children[100];
+        let new = element(&mut doc);
+        doc.mutate().insert_nodes_before(anchor, &[new]);
+        let kids = doc.nodes[parent].children.clone();
+        for i in [0usize, 1, 99, 100, 101, 5000, CHILDREN - 1, CHILDREN] {
+            let node = &doc.nodes[kids[i]];
+            assert_eq!(node.forward(1).map(|n| n.id), kids.get(i + 1).copied());
+            assert_eq!(node.forward(3).map(|n| n.id), kids.get(i + 3).copied());
+            assert_eq!(
+                node.backward(1).map(|n| n.id),
+                i.checked_sub(1).map(|j| kids[j])
+            );
+            assert_eq!(
+                node.backward(2).map(|n| n.id),
+                i.checked_sub(2).map(|j| kids[j])
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_queries_give_identical_results() {
+        let (doc, parent) = tree();
+        let kids = doc.nodes[parent].children.clone();
+        // The document holds a shell provider that is not `Sync`; the nodes are (`unsafe impl Sync for Node`).
+        let nodes = &doc.nodes;
+        let expected: Vec<Option<usize>> = (0..CHILDREN).map(Some).collect();
+        let results: Vec<Vec<Option<usize>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4)
+                .map(|t| {
+                    let (nodes, kids) = (nodes, &kids);
+                    s.spawn(move || {
+                        // Each thread walks the children from a different place and in a different direction.
+                        let mut out = vec![None; CHILDREN];
+                        let order: Vec<usize> = match t {
+                            0 => (0..CHILDREN).collect(),
+                            1 => (0..CHILDREN).rev().collect(),
+                            2 => (0..CHILDREN).map(|i| (i * 7919) % CHILDREN).collect(),
+                            _ => (CHILDREN / 2..CHILDREN).chain(0..CHILDREN / 2).collect(),
+                        };
+                        for i in order {
+                            out[i] = nodes[kids[i]].child_index();
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (t, got) in results.iter().enumerate() {
+            assert_eq!(got, &expected, "thread {t}");
+        }
     }
 }
