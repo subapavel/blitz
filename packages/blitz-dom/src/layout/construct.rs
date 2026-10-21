@@ -338,13 +338,10 @@ pub(crate) fn collect_layout_children(
                 .downcast_element_mut()
                 .unwrap()
                 .special_data = data;
-            if let Some(before) = doc.nodes[container_node_id].before {
-                layout_children.push(before);
-            }
+            // The table's `::before` and `::after` boxes are table children like the DOM ones (see
+            // `table_children_with_pseudos`): they are laid out as cells, rows or the content of an anonymous
+            // cell, and reach the layout children of the table that way.
             layout_children.extend_from_slice(&tlayout_children);
-            if let Some(after) = doc.nodes[container_node_id].after {
-                layout_children.push(after);
-            }
         }
 
         _ => {

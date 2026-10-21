@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Range, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, ops::Range, sync::Arc};
 
 use markup5ever::local_name;
 use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
@@ -118,7 +118,14 @@ pub(crate) fn build_table_context(
         row_owners: Vec::new(),
         width_events: Vec::new(),
     };
-    collect_table_children(doc, table_root_node_id, &children, Level::Table, &mut grid);
+    let table_children = table_children_with_pseudos(doc, table_root_node_id, &children);
+    collect_table_children(
+        doc,
+        table_root_node_id,
+        &table_children,
+        Level::Table,
+        &mut grid,
+    );
     let GridBuilder {
         row,
         mut items,
@@ -764,6 +771,30 @@ pub(crate) enum RowSlot {
 pub(crate) enum Slot {
     Keep(usize),
     AnonymousRow(Vec<RowSlot>),
+}
+
+/// The children of a table box as the table sees them: its `::before` box, then its `children`, then its `::after`
+/// box (css-pseudo-4 §3.1: "as if they were real elements inserted as the first and last child"). They take part in
+/// the table's fixup like any other child (CSS 2.1 §17.2.1): a `table-cell` or `table-row` pseudo is a cell or a row,
+/// anything else is wrapped in an anonymous row and cell, and a `table-caption` or `display: none` one has no box
+/// here. `children` is borrowed when the table has no pseudo box.
+fn table_children_with_pseudos<'a>(
+    doc: &BaseDocument,
+    table_id: usize,
+    children: &'a [usize],
+) -> Cow<'a, [usize]> {
+    let table = &doc.nodes[table_id];
+    if table.before.is_none() && table.after.is_none() {
+        return Cow::Borrowed(children);
+    }
+    Cow::Owned(
+        table
+            .before
+            .into_iter()
+            .chain(children.iter().copied())
+            .chain(table.after)
+            .collect(),
+    )
 }
 
 /// Classifies `node` by its computed `display`. See [`TablePart`].
@@ -2009,6 +2040,191 @@ mod pseudo_tests {
     #[test]
     fn a_table_without_pseudos_agrees_too() {
         let (mut doc, _) = resolved("", vec![table("t", vec![row("r", "c", "b")])]);
+        assert_counts_agree(&mut doc);
+    }
+
+    fn context(doc: &BaseDocument, id: usize) -> Arc<TableContext> {
+        match &doc.nodes[id].element_data().unwrap().special_data {
+            crate::node::SpecialElementData::TableRoot(ctx) => Arc::clone(ctx),
+            _ => panic!("{id} is not a table root"),
+        }
+    }
+
+    fn layout_children(doc: &BaseDocument, id: usize) -> Vec<usize> {
+        doc.nodes[id]
+            .layout_children
+            .borrow()
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// The anonymous cell that holds exactly the pseudo box `pseudo`.
+    fn assert_anonymous_cell_of(doc: &BaseDocument, cell: usize, table: usize, pseudo: usize) {
+        let node = &doc.nodes[cell];
+        assert!(matches!(node.data, NodeData::AnonymousBlock(_)), "{cell}");
+        assert_eq!(node.children, vec![pseudo]);
+        assert_eq!(node.layout_parent.get(), Some(table));
+        assert_eq!(node.parent, Some(table));
+    }
+
+    #[test]
+    fn a_table_without_rows_gets_an_anonymous_cell_for_its_before() {
+        let (doc, i) = resolved(BEFORE, vec![table("t", vec![])]);
+        let t = i["t"];
+        let before = doc.nodes[t].before.expect("::before");
+        let lc = layout_children(&doc, t);
+        assert_eq!(lc.len(), 1);
+        assert_anonymous_cell_of(&doc, lc[0], t, before);
+        let ctx = context(&doc, t);
+        assert_eq!(ctx.items.len(), 1);
+        assert_eq!(ctx.items[0].kind, TableItemKind::Cell);
+        assert_eq!(ctx.items[0].node_id, lc[0]);
+    }
+
+    #[test]
+    fn the_pseudos_of_a_table_are_cells_around_its_rows_and_never_listed_themselves() {
+        let (doc, i) = resolved(BOTH, vec![table("t", vec![row("r", "c", "b")])]);
+        let t = i["t"];
+        let (before, after) = (doc.nodes[t].before.unwrap(), doc.nodes[t].after.unwrap());
+        let lc = layout_children(&doc, t);
+        assert_eq!(lc.len(), 3);
+        assert_anonymous_cell_of(&doc, lc[0], t, before);
+        assert_eq!(lc[1], i["c"]);
+        assert_anonymous_cell_of(&doc, lc[2], t, after);
+        assert!(!lc.contains(&before) && !lc.contains(&after));
+        // One grid row each, one column.
+        let ctx = context(&doc, t);
+        let rows: Vec<_> = ctx
+            .items
+            .iter()
+            .filter(|item| item.kind == TableItemKind::Cell)
+            .map(|item| item.style.grid_row.start.clone())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0] != rows[1] && rows[1] != rows[2]);
+    }
+
+    #[test]
+    fn a_display_table_box_puts_its_bare_cell_and_its_pseudo_in_one_anonymous_row() {
+        let css = "#t::after { content: \"A\" }";
+        let cell = E("div", "c", "display:table-cell", vec![T("x")]);
+        let t = E("div", "t", "display:table", vec![cell]);
+        let (doc, i) = resolved(css, vec![t]);
+        let ctx = context(&doc, i["t"]);
+        let after = doc.nodes[i["t"]].after.unwrap();
+        let cells: Vec<_> = ctx
+            .items
+            .iter()
+            .filter(|item| item.kind == TableItemKind::Cell)
+            .collect();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(ctx.items.len(), 2, "no row item for an anonymous row");
+        assert_eq!(cells[0].node_id, i["c"]);
+        assert_anonymous_cell_of(&doc, cells[1].node_id, i["t"], after);
+        assert_eq!(cells[0].style.grid_row, cells[1].style.grid_row);
+        assert!(cells[0].style.grid_column.start != cells[1].style.grid_column.start);
+    }
+
+    #[test]
+    fn the_first_header_comes_first_and_the_first_footer_last_around_the_pseudo_rows() {
+        let group = |tag, name, cell, text| E(tag, name, "", vec![row("r", cell, text)]);
+        let t = table(
+            "t",
+            vec![
+                group("tfoot", "f", "cf", "F"),
+                group("tbody", "b", "cb", "body"),
+                group("thead", "h", "ch", "H"),
+            ],
+        );
+        let (doc, i) = resolved(BOTH, vec![t]);
+        let (before, after) = (
+            doc.nodes[i["t"]].before.unwrap(),
+            doc.nodes[i["t"]].after.unwrap(),
+        );
+        let order: Vec<&str> = context(&doc, i["t"])
+            .items
+            .iter()
+            .filter(|item| item.kind == TableItemKind::Cell)
+            .map(|item| {
+                let node = &doc.nodes[item.node_id];
+                if node.children == [before] {
+                    "B"
+                } else if node.children == [after] {
+                    "A"
+                } else if item.node_id == i["ch"] {
+                    "H"
+                } else if item.node_id == i["cb"] {
+                    "body"
+                } else if item.node_id == i["cf"] {
+                    "F"
+                } else {
+                    "?"
+                }
+            })
+            .collect();
+        assert_eq!(order, ["H", "B", "body", "A", "F"]);
+    }
+
+    #[test]
+    fn a_table_cell_pseudo_is_a_cell_and_a_table_row_pseudo_is_a_row() {
+        let (doc, i) = resolved(
+            "table::before { content: \"B\"; display: table-cell }",
+            vec![table("t", vec![row("r", "c", "b")])],
+        );
+        let before = doc.nodes[i["t"]].before.unwrap();
+        let ctx = context(&doc, i["t"]);
+        let first = &ctx.items[0];
+        assert_eq!(
+            (first.kind.clone(), first.node_id),
+            (TableItemKind::Cell, before)
+        );
+
+        let (doc, i) = resolved(
+            "table::before { content: \"B\"; display: table-row }",
+            vec![table("t", vec![row("r", "c", "b")])],
+        );
+        let before = doc.nodes[i["t"]].before.unwrap();
+        let ctx = context(&doc, i["t"]);
+        let kinds: Vec<_> = ctx.items.iter().map(|item| item.kind.clone()).collect();
+        assert_eq!(ctx.items[0].node_id, before);
+        assert_eq!(
+            kinds,
+            [
+                TableItemKind::Row,
+                TableItemKind::Cell, // the anonymous cell of the pseudo row's text
+                TableItemKind::Row,
+                TableItemKind::Cell
+            ]
+        );
+    }
+
+    #[test]
+    fn a_caption_or_hidden_pseudo_has_no_box_in_the_table() {
+        for display in ["table-caption", "none"] {
+            let css = format!("table::before {{ content: \"B\"; display: {display} }}");
+            let (mut doc, i) = resolved(&css, vec![table("t", vec![row("r", "c", "b")])]);
+            let ctx = context(&doc, i["t"]);
+            assert_eq!(ctx.items.len(), 2, "{display}");
+            assert_eq!(layout_children(&doc, i["t"]), vec![i["c"]], "{display}");
+            assert_counts_agree(&mut doc);
+        }
+    }
+
+    #[test]
+    fn a_table_without_pseudos_borrows_its_children() {
+        let (doc, i) = resolved("", vec![table("t", vec![row("r", "c", "b")])]);
+        let children = doc.nodes[i["t"]].children.clone();
+        let got = table_children_with_pseudos(&doc, i["t"], &children);
+        assert!(matches!(got, Cow::Borrowed(_)));
+        assert_eq!(*got, *children);
+    }
+
+    #[test]
+    fn resolving_twice_gives_the_same_table() {
+        let (mut doc, i) = resolved(BOTH, vec![table("t", vec![row("r", "c", "b")])]);
+        let first = layout_children(&doc, i["t"]).len();
+        doc.resolve(0.0);
+        assert_eq!(layout_children(&doc, i["t"]).len(), first);
         assert_counts_agree(&mut doc);
     }
 }
