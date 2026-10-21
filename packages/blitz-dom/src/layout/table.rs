@@ -1271,9 +1271,12 @@ impl taffy::TraversePartialTree for TableTreeWrapper<'_> {
         RangeIter(0..self.ctx.items.len())
     }
 
+    /// The grid items, like `child_ids` and `get_child_id` (Taffy's loop over the hidden and absolutely positioned
+    /// children indexes `get_child_id` with `0..child_count`). The table's layout children are another list: they
+    /// hold the rows and the cells of anonymous rows, never both rows and their cells.
     #[inline(always)]
-    fn child_count(&self, node_id: taffy::NodeId) -> usize {
-        self.doc.child_count(node_id)
+    fn child_count(&self, _node_id: taffy::NodeId) -> usize {
+        self.ctx.items.len()
     }
 
     #[inline(always)]
@@ -1886,5 +1889,126 @@ mod tests {
         ] {
             assert_eq!(group_role_of_display(inside), None, "{inside:?}");
         }
+    }
+}
+
+/// Tables with `::before` / `::after` boxes, built by hand and resolved (the tree of `contents_tests` in
+/// `construct.rs`; the pseudo-element rules come from a user-agent sheet).
+#[cfg(test)]
+mod pseudo_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::{Attribute, DocumentConfig, QualName, ns};
+
+    enum N {
+        E(&'static str, &'static str, &'static str, Vec<N>),
+        T(&'static str),
+    }
+    use N::{E, T};
+
+    fn build(
+        m: &mut crate::DocumentMutator<'_>,
+        n: &N,
+        ids: &mut HashMap<&'static str, usize>,
+    ) -> usize {
+        match n {
+            T(text) => m.create_text_node(text),
+            E(tag, name, style, kids) => {
+                let attr = |n: &str, v: &str| Attribute {
+                    name: QualName::new(None, ns!(), n.into()),
+                    value: v.to_string(),
+                };
+                let mut attrs = vec![attr("id", name)];
+                if !style.is_empty() {
+                    attrs.push(attr("style", style));
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert(name, id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// Resolves `<html><body>{body}</body></html>` with the rules `css`.
+    fn resolved(css: &str, body: Vec<N>) -> (BaseDocument, HashMap<&'static str, usize>) {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        doc.add_user_agent_stylesheet(css);
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E("html", "html", "", vec![E("body", "body", "", body)]),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    fn table(name: &'static str, kids: Vec<N>) -> N {
+        E("table", name, "", kids)
+    }
+
+    fn row(name: &'static str, cell: &'static str, text: &'static str) -> N {
+        E("tr", name, "", vec![E("td", cell, "", vec![T(text)])])
+    }
+
+    /// For every table root, taffy walks `child_count` children and gets them from `get_child_id`; both must agree
+    /// with the items the grid has.
+    fn assert_counts_agree(doc: &mut BaseDocument) {
+        let roots: Vec<usize> = doc
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.flags.is_table_root())
+            .map(|(id, _)| id)
+            .collect();
+        assert!(!roots.is_empty(), "no table root");
+        for id in roots {
+            let ctx = match &doc.nodes[id].element_data().unwrap().special_data {
+                crate::node::SpecialElementData::TableRoot(ctx) => Arc::clone(ctx),
+                _ => panic!("table root {id} has no table context"),
+            };
+            let items = ctx.items.len();
+            let wrapper = TableTreeWrapper { doc, ctx };
+            let node = taffy::NodeId::from(id);
+            let ids = taffy::TraversePartialTree::child_ids(&wrapper, node).count();
+            assert_eq!(taffy::TraversePartialTree::child_count(&wrapper, node), ids);
+            assert_eq!(ids, items);
+        }
+    }
+
+    const BEFORE: &str = "table::before { content: \"B\" }";
+    const BOTH: &str = "table::before { content: \"B\" } table::after { content: \"A\" }";
+
+    #[test]
+    fn a_table_without_rows_and_with_a_before_resolves() {
+        let (mut doc, _) = resolved(BEFORE, vec![table("t", vec![])]);
+        assert_counts_agree(&mut doc);
+    }
+
+    #[test]
+    fn a_table_with_both_pseudos_and_one_row_resolves() {
+        let (mut doc, _) = resolved(BOTH, vec![table("t", vec![row("r", "c", "b")])]);
+        assert_counts_agree(&mut doc);
+    }
+
+    #[test]
+    fn a_display_table_box_with_an_after_and_a_bare_cell_resolves() {
+        let css = "#t::after { content: \"A\" }";
+        let cell = E("div", "c", "display:table-cell", vec![T("x")]);
+        let t = E("div", "t", "display:table", vec![cell]);
+        let (mut doc, _) = resolved(css, vec![t]);
+        assert_counts_agree(&mut doc);
+    }
+
+    #[test]
+    fn a_table_without_pseudos_agrees_too() {
+        let (mut doc, _) = resolved("", vec![table("t", vec![row("r", "c", "b")])]);
+        assert_counts_agree(&mut doc);
     }
 }
