@@ -25,6 +25,7 @@ pub(crate) mod inline;
 pub(crate) mod list;
 pub(crate) mod replaced;
 pub(crate) mod table;
+pub(crate) mod whitespace;
 
 use self::replaced::{ReplacedContext, replaced_measure_function};
 use self::table::TableTreeWrapper;

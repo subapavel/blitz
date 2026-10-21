@@ -2,9 +2,7 @@ use core::str;
 use std::sync::Arc;
 
 use markup5ever::{QualName, local_name, ns};
-use parley::{
-    FontContext, InlineBox, LayoutContext, StyleProperty, TreeBuilder, WhiteSpaceCollapse,
-};
+use parley::{FontContext, LayoutContext, StyleProperty};
 use slab::Slab;
 use style::{
     data::ElementData as StyloElementData,
@@ -26,20 +24,28 @@ use crate::{
     qual_name, stylo_to_parley,
 };
 
-use super::{damage::ALL_DAMAGE, list::collect_list_item_children, table::build_table_context};
+use super::{
+    damage::ALL_DAMAGE,
+    list::collect_list_item_children,
+    table::build_table_context,
+    whitespace::{InlineOp, collapse_white_space, replay},
+};
 
 use style::values::specified::text::TextTransformCase;
 
 thread_local! {
     /// Whether the next letter pushed into the current inline layout starts a word (for
     /// `text-transform: capitalize`). Reset at the start of every inline layout.
-    static AT_WORD_START: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static AT_WORD_START: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// Applies the case part of `text-transform` (CSS Text 3 §2.1) to a text node's content. Word boundaries
 /// for `capitalize` carry over from the previous text node of the same inline layout, so `wo<b>rd</b>`
 /// stays one word. Language-specific mappings (Turkish dotted i, Greek accents) are not applied.
-fn transform_text(text: &str, case: Option<TextTransformCase>) -> std::borrow::Cow<'_, str> {
+pub(super) fn transform_text(
+    text: &str,
+    case: Option<TextTransformCase>,
+) -> std::borrow::Cow<'_, str> {
     AT_WORD_START.with(|at_word_start| {
         let mut start = at_word_start.get();
         let out = match case {
@@ -906,22 +912,19 @@ pub(crate) fn build_inline_layout_into(
 
     let root_line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
 
-    // Create a parley tree builder
-    let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
-    // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
-    AT_WORD_START.with(|w| w.set(true));
+    // The inline formatting context is recorded as a list of ops first: white space is collapsed across the
+    // boundaries of its elements (`whitespace.rs`) before Parley sees the text.
+    let mut ops: Vec<InlineOp<'_>> = Vec::new();
 
     // `text-wrap-mode` of the root applies to the whole context (Parley cannot switch it per span).
     text_layout.nowrap = root_node_style
         .as_ref()
         .is_some_and(|s| stylo_to_parley::text_wrap_nowrap(s));
 
-    // Set whitespace collapsing mode
+    // The whitespace collapsing mode of the root
     let collapse_mode = root_node_style
         .map(|s| s.get_inherited_text().white_space_collapse)
-        .map(stylo_to_parley::white_space_collapse)
-        .unwrap_or(WhiteSpaceCollapse::Collapse);
-    builder.set_white_space_mode(collapse_mode);
+        .unwrap_or(stylo_to_parley::stylo::WhiteSpaceCollapse::Collapse);
 
     // Render position-inside list items
     if let Some(ListItemLayout {
@@ -932,14 +935,14 @@ pub(crate) fn build_inline_layout_into(
         .and_then(|el| el.list_item_data.as_deref())
     {
         match marker {
-            Marker::Char(char) => builder.push_text(&format!("{char} ")),
-            Marker::String(str) => builder.push_text(str),
+            Marker::Char(char) => ops.push(InlineOp::Marker(format!("{char} "))),
+            Marker::String(str) => ops.push(InlineOp::Marker(str.clone())),
         }
     };
 
     if let Some(before_id) = root_node.before {
         build_inline_layout_recursive(
-            &mut builder,
+            &mut ops,
             nodes,
             inline_context_root_node_id,
             before_id,
@@ -978,22 +981,23 @@ pub(crate) fn build_inline_layout_into(
 
         let common = open.iter().zip(&chain).take_while(|(a, b)| a == b).count();
         while open.len() > common {
-            builder.pop_style_span();
+            ops.push(InlineOp::PopSpan);
             open.pop();
         }
         for &wrapper_id in &chain[common..] {
-            builder.push_style_span(inline_span_style(&nodes[wrapper_id], root_line_height));
+            ops.push(InlineOp::PushSpan(inline_span_style(
+                &nodes[wrapper_id],
+                root_line_height,
+            )));
             open.push(wrapper_id);
         }
         let collapse_mode = open
             .last()
             .and_then(|&id| nodes[id].primary_styles())
-            .map(|s| {
-                stylo_to_parley::white_space_collapse(s.get_inherited_text().white_space_collapse)
-            })
+            .map(|s| s.get_inherited_text().white_space_collapse)
             .unwrap_or(collapse_mode);
         build_inline_layout_recursive(
-            &mut builder,
+            &mut ops,
             nodes,
             inline_context_root_node_id,
             child_id,
@@ -1002,11 +1006,11 @@ pub(crate) fn build_inline_layout_into(
         );
     }
     while open.pop().is_some() {
-        builder.pop_style_span();
+        ops.push(InlineOp::PopSpan);
     }
     if let Some(after_id) = root_node.after {
         build_inline_layout_recursive(
-            &mut builder,
+            &mut ops,
             nodes,
             inline_context_root_node_id,
             after_id,
@@ -1015,13 +1019,19 @@ pub(crate) fn build_inline_layout_into(
         );
     }
 
+    // Create a parley tree builder
+    let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
+    // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
+    AT_WORD_START.with(|w| w.set(true));
+    replay(collapse_white_space(ops), &mut builder);
+
     text_layout.text = builder.build_into(&mut text_layout.layout);
     return;
 
     /// Whether a `display: contents` element needs a style span of its own in an inline layout. It does not when
     /// its text style, colour and white-space mode equal those of its parent, it draws no text decoration and it is
-    /// not a link: its children then build exactly as they would without it, and a span would only add the
-    /// whitespace trimming Parley does at the boundaries of a span.
+    /// not a link: its children then build exactly as they would without it, and a span would only add a style run
+    /// (white space collapses across the boundary either way, `whitespace.rs`).
     fn contents_needs_span(nodes: &Slab<Node>, node: &Node) -> bool {
         let (Some(styles), Some(parent_styles)) = (
             node.primary_styles(),
@@ -1067,12 +1077,12 @@ pub(crate) fn build_inline_layout_into(
         style
     }
 
-    fn build_inline_layout_recursive(
-        builder: &mut TreeBuilder<TextBrush>,
-        nodes: &Slab<Node>,
+    fn build_inline_layout_recursive<'a>(
+        ops: &mut Vec<InlineOp<'a>>,
+        nodes: &'a Slab<Node>,
         parent_id: usize,
         node_id: usize,
-        collapse_mode: WhiteSpaceCollapse,
+        collapse_mode: stylo_to_parley::stylo::WhiteSpaceCollapse,
         root_line_height: f32,
     ) {
         let node = &nodes[node_id];
@@ -1084,9 +1094,7 @@ pub(crate) fn build_inline_layout_into(
         let collapse_mode = node
             .primary_styles()
             .map(|s| s.get_inherited_text().white_space_collapse)
-            .map(stylo_to_parley::white_space_collapse)
             .unwrap_or(collapse_mode);
-        builder.set_white_space_mode(collapse_mode);
 
         match &node.data {
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
@@ -1108,7 +1116,10 @@ pub(crate) fn build_inline_layout_into(
                         // its brush identifies them (colour, decoration, link) in the paint.
                         let span = contents_needs_span(nodes, node);
                         if span {
-                            builder.push_style_span(inline_span_style(node, root_line_height));
+                            ops.push(InlineOp::PushSpan(inline_span_style(
+                                node,
+                                root_line_height,
+                            )));
                         }
                         for child_id in node
                             .before
@@ -1117,7 +1128,7 @@ pub(crate) fn build_inline_layout_into(
                             .chain(node.after)
                         {
                             build_inline_layout_recursive(
-                                builder,
+                                ops,
                                 nodes,
                                 parent_id,
                                 child_id,
@@ -1126,7 +1137,7 @@ pub(crate) fn build_inline_layout_into(
                             );
                         }
                         if span {
-                            builder.pop_style_span();
+                            ops.push(InlineOp::PopSpan);
                         }
                     }
                     (DisplayOutside::Inline, DisplayInside::Flow) => {
@@ -1138,27 +1149,20 @@ pub(crate) fn build_inline_layout_into(
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")
                         {
-                            builder.push_inline_box(InlineBox {
-                                id: node_id as u64,
-                                // Overridden by push_inline_box method
-                                index: 0,
-                                // Width and height are set during layout
-                                width: 0.0,
-                                height: 0.0,
-                            });
+                            ops.push(InlineOp::InlineBox(node_id as u64));
                         } else if *tag_name == local_name!("br") {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             // TODO: update span id for br spans
-                            push_forced_break(builder, collapse_mode);
+                            ops.push(InlineOp::ForcedBreak);
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = inline_span_style(node, root_line_height);
 
-                            builder.push_style_span(style);
+                            ops.push(InlineOp::PushSpan(style));
 
                             if let Some(before_id) = node.before {
                                 build_inline_layout_recursive(
-                                    builder,
+                                    ops,
                                     nodes,
                                     node_id,
                                     before_id,
@@ -1169,7 +1173,7 @@ pub(crate) fn build_inline_layout_into(
 
                             for child_id in node.children.iter().copied() {
                                 build_inline_layout_recursive(
-                                    builder,
+                                    ops,
                                     nodes,
                                     node_id,
                                     child_id,
@@ -1179,7 +1183,7 @@ pub(crate) fn build_inline_layout_into(
                             }
                             if let Some(after_id) = node.after {
                                 build_inline_layout_recursive(
-                                    builder,
+                                    ops,
                                     nodes,
                                     node_id,
                                     after_id,
@@ -1188,19 +1192,12 @@ pub(crate) fn build_inline_layout_into(
                                 );
                             }
 
-                            builder.pop_style_span();
+                            ops.push(InlineOp::PopSpan);
                         }
                     }
                     // Inline box
                     (_, _) => {
-                        builder.push_inline_box(InlineBox {
-                            id: node_id as u64,
-                            // Overridden by push_inline_box method
-                            index: 0,
-                            // Width and height are set during layout
-                            width: 0.0,
-                            height: 0.0,
-                        });
+                        ops.push(InlineOp::InlineBox(node_id as u64));
                     }
                 };
             }
@@ -1214,25 +1211,14 @@ pub(crate) fn build_inline_layout_into(
                 let case = parent_style
                     .as_ref()
                     .map(|style| style.clone_text_transform().case());
-                let text = transform_text(&data.content, case);
-                // `white-space: pre-line` collapses spaces and tabs but keeps segment breaks. Parley has only
-                // the two modes, so the text is split at its newlines: the pieces are collapsed and each
-                // newline is pushed as a preserved one, like a `<br>`. Parley's collapse then drops the
-                // indentation that follows a newline (it trims the start of text after whitespace).
-                let preserve_breaks = parent_style.as_ref().is_some_and(|style| {
-                    style.get_inherited_text().white_space_collapse
-                        == stylo_to_parley::stylo::WhiteSpaceCollapse::PreserveBreaks
+                // The text goes in as it is. `collapse_white_space` collapses it with its neighbours (across the
+                // boundaries of elements) and splits `white-space: pre-line` text at its newlines, and `replay`
+                // applies `text-transform` to what is left.
+                ops.push(InlineOp::Text {
+                    text: std::borrow::Cow::Borrowed(data.content.as_str()),
+                    collapse: collapse_mode,
+                    case,
                 });
-                if preserve_breaks && text.contains('\n') {
-                    for (index, piece) in text.split('\n').enumerate() {
-                        if index > 0 {
-                            push_forced_break(builder, collapse_mode);
-                        }
-                        builder.push_text(piece);
-                    }
-                } else {
-                    builder.push_text(&text);
-                }
             }
             NodeData::Comment => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -1240,18 +1226,6 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document => unreachable!(),
         }
     }
-}
-
-/// Pushes a preserved newline: the text before it is committed with `collapse_mode`, the newline itself is
-/// preserved, and `collapse_mode` is active again afterwards.
-fn push_forced_break(builder: &mut TreeBuilder<TextBrush>, collapse_mode: WhiteSpaceCollapse) {
-    builder.push_style_modification_span(&[]);
-    builder.set_white_space_mode(WhiteSpaceCollapse::Preserve);
-    builder.push_text("\n");
-    // A forced line break ends the word for `text-transform: capitalize`.
-    AT_WORD_START.with(|w| w.set(true));
-    builder.pop_style_span();
-    builder.set_white_space_mode(collapse_mode);
 }
 
 /// The combining diacritical mark blocks (enough for decomposed Latin, Greek and Cyrillic text).
@@ -1776,5 +1750,185 @@ mod contents_tests {
         assert_live(&doc, 0);
         assert_eq!(shape(&doc), before);
         assert_eq!(layout_children(&doc, i["o"]).len(), first.len());
+    }
+}
+
+/// The text of inline formatting contexts after white space collapsing across element boundaries (`whitespace.rs`,
+/// CSS Text 3 §4.1.1), as it reaches Parley.
+#[cfg(test)]
+mod whitespace_tests {
+    use std::collections::HashMap;
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, ns};
+
+    enum N {
+        E(&'static str, &'static str, &'static str, Vec<N>),
+        T(&'static str),
+    }
+    use N::{E, T};
+
+    fn build(
+        m: &mut crate::DocumentMutator<'_>,
+        n: &N,
+        ids: &mut HashMap<&'static str, usize>,
+    ) -> usize {
+        match n {
+            T(text) => m.create_text_node(text),
+            E(tag, name, style, kids) => {
+                let attr = |n: &str, v: &str| Attribute {
+                    name: QualName::new(None, ns!(), n.into()),
+                    value: v.to_string(),
+                };
+                let mut attrs = vec![attr("id", name)];
+                if !style.is_empty() {
+                    attrs.push(attr("style", style));
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert(name, id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// Resolves `<html><body>{body}</body></html>` and returns the text of the inline layout of the element `root`.
+    fn text(root: &'static str, body: Vec<N>) -> String {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E("html", "html", "", vec![E("body", "body", "", body)]),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        doc.nodes[ids[root]]
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .map(|layout| layout.text.clone())
+            .unwrap_or_else(|| panic!("{root} has no inline layout"))
+    }
+
+    fn p(style: &'static str, kids: Vec<N>) -> Vec<N> {
+        vec![E("p", "p", style, kids)]
+    }
+
+    fn span(kids: Vec<N>) -> N {
+        E("span", "s", "", kids)
+    }
+
+    #[test]
+    fn a_space_inside_a_span_is_kept() {
+        // a <span>b </span>d
+        assert_eq!(
+            text("p", p("", vec![T("a "), span(vec![T("b ")]), T("d")])),
+            "a b d"
+        );
+        // a<span> b</span> d
+        assert_eq!(
+            text("p", p("", vec![T("a"), span(vec![T(" b")]), T(" d")])),
+            "a b d"
+        );
+        // a <span>b <i>c </i></span>d
+        let inner = span(vec![T("b "), E("i", "i", "", vec![T("c ")])]);
+        assert_eq!(text("p", p("", vec![T("a "), inner, T("d")])), "a b c d");
+    }
+
+    #[test]
+    fn two_spaces_collapse_to_the_first() {
+        assert_eq!(text("p", p("", vec![T("a "), span(vec![T(" b")])])), "a b");
+        assert_eq!(
+            text("p", p("", vec![T("a"), span(vec![T(" ")]), T(" b")])),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn spaces_at_the_ends_of_the_context_are_removed() {
+        let kids = vec![span(vec![T(" a")]), T(" b "), span(vec![T("c ")])];
+        assert_eq!(text("p", p("", kids)), "a b c");
+    }
+
+    #[test]
+    fn spaces_around_a_forced_break_are_removed() {
+        // a <br> <span> b</span>
+        let kids = vec![
+            T("a "),
+            E("br", "br", "", vec![]),
+            T(" "),
+            span(vec![T(" b")]),
+        ];
+        assert_eq!(text("p", p("", kids)), "a\nb");
+        // pre-line: a <span>b </span>\n  c
+        let kids = vec![T("a "), span(vec![T("b ")]), T("\n  c")];
+        assert_eq!(text("p", p("white-space:pre-line", kids)), "a b\nc");
+    }
+
+    #[test]
+    fn a_collapsible_space_after_a_preserved_one_is_kept() {
+        let pre = E("span", "s", "white-space:pre", vec![T("  b  ")]);
+        assert_eq!(text("p", p("", vec![T("a "), pre, T(" c")])), "a   b   c");
+    }
+
+    #[test]
+    fn atomic_inlines_are_content() {
+        let block = E("span", "s", "display:inline-block", vec![T("X")]);
+        // The text has no character for the box; the two spaces are the ones before and after it.
+        assert_eq!(text("p", p("", vec![T("a "), block, T(" b")])), "a  b");
+    }
+
+    #[test]
+    fn a_contents_element_with_a_style_keeps_its_space() {
+        let wrapper = E("span", "w", "display:contents;color:red", vec![T("b ")]);
+        assert_eq!(text("p", p("", vec![T("a "), wrapper, T("d")])), "a b d");
+    }
+
+    #[test]
+    fn capitalize_follows_the_collapsing() {
+        let kids = vec![T("a "), span(vec![T("b ")]), T("d")];
+        assert_eq!(text("p", p("text-transform:capitalize", kids)), "A B D");
+    }
+
+    #[test]
+    fn no_break_spaces_are_never_collapsed() {
+        let kids = vec![E("b", "b", "", vec![T("12\u{a0}")]), T("\u{a0}000")];
+        assert_eq!(text("p", p("", kids)), "12\u{a0}\u{a0}000");
+    }
+
+    #[test]
+    fn the_body_is_an_inline_root_too() {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let kids = vec![T("Faktura "), E("b", "b", "", vec![T("č. ")]), T("2026")];
+            let html = build(
+                &mut m,
+                &E("html", "html", "", vec![E("body", "body", "", kids)]),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        let body = doc.nodes[ids["body"]]
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .expect("the body is an inline root");
+        assert_eq!(body.text, "Faktura č. 2026");
+    }
+
+    #[test]
+    fn an_inside_marker_swallows_the_leading_spaces() {
+        let list = vec![E(
+            "ul",
+            "u",
+            "list-style-position:inside",
+            vec![E("li", "li", "", vec![T(" "), span(vec![T(" x")])])],
+        )];
+        assert_eq!(text("li", list), "• x");
     }
 }
