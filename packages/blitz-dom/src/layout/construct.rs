@@ -186,11 +186,11 @@ pub(crate) fn collect_layout_children(
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
-            let resolver = doc
-                .svg_image_resolver
+            let options = doc
+                .svg_options
                 .as_ref()
                 .map(|factory| factory(container_node_id));
-            match crate::util::parse_svg(outer_html.as_bytes(), resolver) {
+            match crate::util::parse_svg(outer_html.as_bytes(), options) {
                 Ok(svg) => {
                     doc.get_node_mut(container_node_id)
                         .unwrap()
@@ -1934,16 +1934,19 @@ mod whitespace_tests {
     }
 }
 
-/// The `<image>` elements of an inline `<svg>` are resolved by the resolver the document's factory makes.
+/// An inline `<svg>` is parsed with the `usvg::Options` the document's factory makes: its image resolver and its fonts.
 #[cfg(all(test, feature = "svg"))]
-mod svg_image_resolver_tests {
+mod svg_options_tests {
     use std::sync::{Arc, Mutex};
 
     use crate::node::{ImageData, SpecialElementData};
-    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, SvgImageResolverFactory, ns};
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, SvgOptionsFactory, ns};
 
     /// A 1 x 1 PNG.
     const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    /// A font that has a glyph for U+2022 (the bullet) and nothing else worth naming.
+    const BULLET_FONT: &[u8] = include_bytes!("../../assets/moz-bullet-font.otf");
 
     fn attr(name: &str, value: &str) -> Attribute {
         Attribute {
@@ -1952,9 +1955,13 @@ mod svg_image_resolver_tests {
         }
     }
 
-    /// `<html><body><svg><image href=PNG></svg><svg>...` (`svgs` of them); returns the document and the ids of
-    /// the `<svg>` elements.
-    fn document(config: DocumentConfig, svgs: usize) -> (BaseDocument, Vec<usize>) {
+    /// `<html><body><svg>...</svg>...</body></html>` (`svgs` of them, each built by `fill`); returns the document and
+    /// the ids of the `<svg>` elements.
+    fn document_with(
+        config: DocumentConfig,
+        svgs: usize,
+        fill: impl Fn(&mut crate::DocumentMutator<'_>, usize),
+    ) -> (BaseDocument, Vec<usize>) {
         let mut doc = BaseDocument::new(config);
         let mut ids = Vec::new();
         {
@@ -1966,11 +1973,7 @@ mod svg_image_resolver_tests {
                     QualName::new(None, ns!(svg), "svg".into()),
                     vec![attr("width", "10"), attr("height", "10")],
                 );
-                let image = m.create_element(
-                    QualName::new(None, ns!(svg), "image".into()),
-                    vec![attr("href", PNG), attr("width", "10"), attr("height", "10")],
-                );
-                m.append_children(svg, &[image]);
+                fill(&mut m, svg);
                 m.append_children(body, &[svg]);
                 ids.push(svg);
             }
@@ -1981,25 +1984,89 @@ mod svg_image_resolver_tests {
         (doc, ids)
     }
 
-    fn images(doc: &BaseDocument, svg: usize) -> usize {
-        fn walk(group: &usvg::Group) -> usize {
-            group
-                .children()
-                .iter()
-                .map(|node| match node {
-                    usvg::Node::Image(_) => 1,
-                    usvg::Node::Group(g) => walk(g),
-                    _ => 0,
-                })
-                .sum()
-        }
+    /// `<svg><image href=PNG></svg>`
+    fn document(config: DocumentConfig, svgs: usize) -> (BaseDocument, Vec<usize>) {
+        document_with(config, svgs, |m, svg| {
+            let image = m.create_element(
+                QualName::new(None, ns!(svg), "image".into()),
+                vec![attr("href", PNG), attr("width", "10"), attr("height", "10")],
+            );
+            m.append_children(svg, &[image]);
+        })
+    }
+
+    /// `<svg><text font-family=family>&bull;</text></svg>`
+    fn text_document(config: DocumentConfig, family: &str) -> (BaseDocument, usize) {
+        let (doc, ids) = document_with(config, 1, |m, svg| {
+            let text = m.create_element(
+                QualName::new(None, ns!(svg), "text".into()),
+                vec![
+                    attr("x", "1"),
+                    attr("y", "8"),
+                    attr("font-size", "8"),
+                    attr("font-family", family),
+                ],
+            );
+            let content = m.create_text_node("\u{2022}");
+            m.append_children(text, &[content]);
+            m.append_children(svg, &[text]);
+        });
+        (doc, ids[0])
+    }
+
+    fn tree(doc: &BaseDocument, svg: usize) -> &usvg::Tree {
         match doc.nodes[svg].element_data().map(|e| &e.special_data) {
             Some(SpecialElementData::Image(data)) => match &**data {
-                ImageData::Svg(tree) => walk(tree.root()),
+                ImageData::Svg(tree) => tree,
                 _ => panic!("the <svg> is not parsed"),
             },
             _ => panic!("the <svg> has no tree"),
         }
+    }
+
+    fn count(doc: &BaseDocument, svg: usize, f: fn(&usvg::Node) -> bool) -> usize {
+        fn walk(group: &usvg::Group, f: fn(&usvg::Node) -> bool) -> usize {
+            group
+                .children()
+                .iter()
+                .map(|node| {
+                    usize::from(f(node))
+                        + match node {
+                            usvg::Node::Group(g) => walk(g, f),
+                            usvg::Node::Text(t) => walk(t.flattened(), f),
+                            _ => 0,
+                        }
+                })
+                .sum()
+        }
+        walk(tree(doc, svg).root(), f)
+    }
+
+    fn images(doc: &BaseDocument, svg: usize) -> usize {
+        count(doc, svg, |n| matches!(n, usvg::Node::Image(_)))
+    }
+
+    fn texts(doc: &BaseDocument, svg: usize) -> usize {
+        count(doc, svg, |n| matches!(n, usvg::Node::Text(_)))
+    }
+
+    fn factory(
+        f: impl Fn(usize) -> usvg::Options<'static> + Send + Sync + 'static,
+    ) -> DocumentConfig {
+        DocumentConfig {
+            svg_options: Some(Arc::new(f) as SvgOptionsFactory),
+            ..DocumentConfig::default()
+        }
+    }
+
+    /// A font database that holds only the bullet font, and the font's family name.
+    fn bullet_db() -> (Arc<usvg::fontdb::Database>, String) {
+        let mut db = usvg::fontdb::Database::new();
+        db.load_font_data(BULLET_FONT.to_vec());
+        let family = db.faces().next().expect("the bullet font loads").families[0]
+            .0
+            .clone();
+        (Arc::new(db), family)
     }
 
     #[test]
@@ -2012,17 +2079,16 @@ mod svg_image_resolver_tests {
     fn a_resolver_that_refuses_leaves_no_image_node() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
-        let factory: SvgImageResolverFactory = Arc::new(move |node_id| {
+        let config = factory(move |node_id| {
             log.lock().unwrap().push(node_id);
-            usvg::ImageHrefResolver {
-                resolve_data: Box::new(|_, _, _| None),
-                resolve_string: Box::new(|_, _| None),
+            usvg::Options {
+                image_href_resolver: usvg::ImageHrefResolver {
+                    resolve_data: Box::new(|_, _, _| None),
+                    resolve_string: Box::new(|_, _| None),
+                },
+                ..usvg::Options::default()
             }
         });
-        let config = DocumentConfig {
-            svg_image_resolver: Some(factory),
-            ..DocumentConfig::default()
-        };
         let (doc, ids) = document(config, 2);
         // The factory is called with the id of the <svg> being parsed, and the SVG is still a tree.
         assert_eq!(*seen.lock().unwrap(), ids);
@@ -2031,16 +2097,52 @@ mod svg_image_resolver_tests {
     }
 
     #[test]
-    fn a_resolver_that_delegates_gives_the_same_tree() {
-        let factory: SvgImageResolverFactory = Arc::new(|_| usvg::ImageHrefResolver {
-            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
-            resolve_string: usvg::ImageHrefResolver::default_string_resolver(),
-        });
-        let config = DocumentConfig {
-            svg_image_resolver: Some(factory),
-            ..DocumentConfig::default()
-        };
+    fn default_options_from_the_factory_give_the_same_tree() {
+        let config = factory(|_| usvg::Options::default());
         let (doc, ids) = document(config, 1);
         assert_eq!(images(&doc, ids[0]), 1);
+    }
+
+    #[test]
+    fn the_factorys_font_database_is_what_text_is_shaped_with() {
+        let (db, family) = bullet_db();
+        let config = factory(move |_| usvg::Options {
+            fontdb: Arc::clone(&db),
+            ..usvg::Options::default()
+        });
+        let (doc, svg) = text_document(config, &family);
+        assert_eq!(texts(&doc, svg), 1, "the bundled face draws the text");
+
+        // The same text with an empty database (usvg's default) finds no face: no text node, no host font.
+        let (doc, svg) = text_document(factory(|_| usvg::Options::default()), &family);
+        assert_eq!(texts(&doc, svg), 0);
+    }
+
+    #[test]
+    fn the_factorys_font_resolver_picks_the_face() {
+        let (db, _) = bullet_db();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&asked);
+        let config = factory(move |_| {
+            let log = Arc::clone(&log);
+            let default = usvg::FontResolver::default_font_selector();
+            usvg::Options {
+                fontdb: Arc::clone(&db),
+                font_resolver: usvg::FontResolver {
+                    select_font: Box::new(move |font, db| {
+                        log.lock().unwrap().push(format!("{:?}", font.families()));
+                        default(font, db)
+                    }),
+                    select_fallback: usvg::FontResolver::default_fallback_selector(),
+                },
+                ..usvg::Options::default()
+            }
+        });
+        // A family nobody has: the resolver is asked, answers through the default selector, and finds nothing.
+        let (doc, svg) = text_document(config, "Nobody Has This");
+        let asked = asked.lock().unwrap();
+        assert!(!asked.is_empty(), "the resolver is asked");
+        assert!(asked[0].contains("Nobody Has This"), "{asked:?}");
+        assert_eq!(texts(&doc, svg), 0);
     }
 }

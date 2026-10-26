@@ -7,12 +7,13 @@ use blitz_traits::{
 use parley::FontContext;
 use std::sync::Arc;
 
-/// Makes the `<image>` href resolver of one inline `<svg>`; called with the id of the `<svg>` node each time the
-/// element is parsed. With it, a host decides which images an SVG may load (and can refuse, say, a PNG it cannot
-/// decode) instead of leaving that to usvg's default resolver, which only looks at the MIME type or the magic bytes.
+/// Makes the `usvg::Options` of one inline `<svg>`; called with the id of the `<svg>` node each time the element is
+/// parsed. With it, a host decides everything the parse may look at: which images an `<image>` may load (and can
+/// refuse, say, a PNG it cannot decode, instead of usvg's default resolver, which only looks at the MIME type or the
+/// magic bytes), and which fonts `<text>` is shaped with (`fontdb`, `font_resolver`, `font_family`). Without it the
+/// parse uses usvg's defaults plus a process-wide database of the host's system fonts.
 #[cfg(feature = "svg")]
-pub type SvgImageResolverFactory =
-    Arc<dyn Fn(usize) -> usvg::ImageHrefResolver<'static> + Send + Sync>;
+pub type SvgOptionsFactory = Arc<dyn Fn(usize) -> usvg::Options<'static> + Send + Sync>;
 
 /// Options used when constructing a [`BaseDocument`](crate::BaseDocument)
 #[derive(Default)]
@@ -37,7 +38,8 @@ pub struct DocumentConfig {
     /// uses this lock instead of a new one and starts with these sheets instead of parsing Blitz's own;
     /// `ua_stylesheets` must be `None` and `base_url` must equal the one of the `SharedStyles`.
     pub shared_styles: Option<SharedStyles>,
-    /// Resolver for the `<image>` elements of inline `<svg>` elements. `None` keeps usvg's default resolver.
+    /// Options for parsing an inline `<svg>` (images, fonts). `None` keeps usvg's defaults and the host's system
+    /// fonts.
     #[cfg(feature = "svg")]
-    pub svg_image_resolver: Option<SvgImageResolverFactory>,
+    pub svg_options: Option<SvgOptionsFactory>,
 }
