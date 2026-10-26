@@ -336,7 +336,7 @@ impl NetHandler<Resource> for ImageHandler {
         #[cfg(feature = "svg")]
         {
             use crate::util::parse_svg;
-            if let Ok(tree) = parse_svg(&bytes) {
+            if let Ok(tree) = parse_svg(&bytes, None) {
                 callback.call(doc_id, Ok(Resource::Svg(self.0, self.1, Box::new(tree))));
                 return;
             }

@@ -186,7 +186,11 @@ pub(crate) fn collect_layout_children(
                 doc.nodes[id].remove_damage(CONSTRUCT_BOX | CONSTRUCT_DESCENDENT | CONSTRUCT_FC);
             });
 
-            match crate::util::parse_svg(outer_html.as_bytes()) {
+            let resolver = doc
+                .svg_image_resolver
+                .as_ref()
+                .map(|factory| factory(container_node_id));
+            match crate::util::parse_svg(outer_html.as_bytes(), resolver) {
                 Ok(svg) => {
                     doc.get_node_mut(container_node_id)
                         .unwrap()
@@ -1927,5 +1931,116 @@ mod whitespace_tests {
             vec![E("li", "li", "", vec![T(" "), span(vec![T(" x")])])],
         )];
         assert_eq!(text("li", list), "• x");
+    }
+}
+
+/// The `<image>` elements of an inline `<svg>` are resolved by the resolver the document's factory makes.
+#[cfg(all(test, feature = "svg"))]
+mod svg_image_resolver_tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::node::{ImageData, SpecialElementData};
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, SvgImageResolverFactory, ns};
+
+    /// A 1 x 1 PNG.
+    const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    fn attr(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: QualName::new(None, ns!(), name.into()),
+            value: value.to_string(),
+        }
+    }
+
+    /// `<html><body><svg><image href=PNG></svg><svg>...` (`svgs` of them); returns the document and the ids of
+    /// the `<svg>` elements.
+    fn document(config: DocumentConfig, svgs: usize) -> (BaseDocument, Vec<usize>) {
+        let mut doc = BaseDocument::new(config);
+        let mut ids = Vec::new();
+        {
+            let mut m = doc.mutate();
+            let html = m.create_element(QualName::new(None, ns!(html), "html".into()), vec![]);
+            let body = m.create_element(QualName::new(None, ns!(html), "body".into()), vec![]);
+            for _ in 0..svgs {
+                let svg = m.create_element(
+                    QualName::new(None, ns!(svg), "svg".into()),
+                    vec![attr("width", "10"), attr("height", "10")],
+                );
+                let image = m.create_element(
+                    QualName::new(None, ns!(svg), "image".into()),
+                    vec![attr("href", PNG), attr("width", "10"), attr("height", "10")],
+                );
+                m.append_children(svg, &[image]);
+                m.append_children(body, &[svg]);
+                ids.push(svg);
+            }
+            m.append_children(html, &[body]);
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    fn images(doc: &BaseDocument, svg: usize) -> usize {
+        fn walk(group: &usvg::Group) -> usize {
+            group
+                .children()
+                .iter()
+                .map(|node| match node {
+                    usvg::Node::Image(_) => 1,
+                    usvg::Node::Group(g) => walk(g),
+                    _ => 0,
+                })
+                .sum()
+        }
+        match doc.nodes[svg].element_data().map(|e| &e.special_data) {
+            Some(SpecialElementData::Image(data)) => match &**data {
+                ImageData::Svg(tree) => walk(tree.root()),
+                _ => panic!("the <svg> is not parsed"),
+            },
+            _ => panic!("the <svg> has no tree"),
+        }
+    }
+
+    #[test]
+    fn without_a_factory_usvgs_resolver_is_used() {
+        let (doc, ids) = document(DocumentConfig::default(), 1);
+        assert_eq!(images(&doc, ids[0]), 1);
+    }
+
+    #[test]
+    fn a_resolver_that_refuses_leaves_no_image_node() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let factory: SvgImageResolverFactory = Arc::new(move |node_id| {
+            log.lock().unwrap().push(node_id);
+            usvg::ImageHrefResolver {
+                resolve_data: Box::new(|_, _, _| None),
+                resolve_string: Box::new(|_, _| None),
+            }
+        });
+        let config = DocumentConfig {
+            svg_image_resolver: Some(factory),
+            ..DocumentConfig::default()
+        };
+        let (doc, ids) = document(config, 2);
+        // The factory is called with the id of the <svg> being parsed, and the SVG is still a tree.
+        assert_eq!(*seen.lock().unwrap(), ids);
+        assert_eq!(images(&doc, ids[0]), 0);
+        assert_eq!(images(&doc, ids[1]), 0);
+    }
+
+    #[test]
+    fn a_resolver_that_delegates_gives_the_same_tree() {
+        let factory: SvgImageResolverFactory = Arc::new(|_| usvg::ImageHrefResolver {
+            resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+            resolve_string: usvg::ImageHrefResolver::default_string_resolver(),
+        });
+        let config = DocumentConfig {
+            svg_image_resolver: Some(factory),
+            ..DocumentConfig::default()
+        };
+        let (doc, ids) = document(config, 1);
+        assert_eq!(images(&doc, ids[0]), 1);
     }
 }

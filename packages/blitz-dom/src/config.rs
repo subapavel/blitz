@@ -7,6 +7,13 @@ use blitz_traits::{
 use parley::FontContext;
 use std::sync::Arc;
 
+/// Makes the `<image>` href resolver of one inline `<svg>`; called with the id of the `<svg>` node each time the
+/// element is parsed. With it, a host decides which images an SVG may load (and can refuse, say, a PNG it cannot
+/// decode) instead of leaving that to usvg's default resolver, which only looks at the MIME type or the magic bytes.
+#[cfg(feature = "svg")]
+pub type SvgImageResolverFactory =
+    Arc<dyn Fn(usize) -> usvg::ImageHrefResolver<'static> + Send + Sync>;
+
 /// Options used when constructing a [`BaseDocument`](crate::BaseDocument)
 #[derive(Default)]
 pub struct DocumentConfig {
@@ -30,4 +37,7 @@ pub struct DocumentConfig {
     /// uses this lock instead of a new one and starts with these sheets instead of parsing Blitz's own;
     /// `ua_stylesheets` must be `None` and `base_url` must equal the one of the `SharedStyles`.
     pub shared_styles: Option<SharedStyles>,
+    /// Resolver for the `<image>` elements of inline `<svg>` elements. `None` keeps usvg's default resolver.
+    #[cfg(feature = "svg")]
+    pub svg_image_resolver: Option<SvgImageResolverFactory>,
 }

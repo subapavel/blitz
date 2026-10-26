@@ -65,6 +65,8 @@ pub mod util;
 mod accessibility;
 
 pub use config::DocumentConfig;
+#[cfg(feature = "svg")]
+pub use config::SvgImageResolverFactory;
 pub use document::{BaseDocument, Document};
 pub use layout::collapsed_borders::{BorderSpec, CollapsedBorders, CollapsedCell, EdgeOrigin};
 pub use markup5ever::{

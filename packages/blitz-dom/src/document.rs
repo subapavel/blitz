@@ -236,6 +236,10 @@ pub struct BaseDocument {
     pub shell_provider: Arc<dyn ShellProvider>,
     /// HTML parser provider. Used to parse HTML for setInnerHTML
     pub html_parser_provider: Arc<dyn HtmlParserProvider>,
+
+    /// Makes the `<image>` href resolver of an inline `<svg>` (`None`: usvg's default)
+    #[cfg(feature = "svg")]
+    pub(crate) svg_image_resolver: Option<crate::config::SvgImageResolverFactory>,
 }
 
 pub(crate) fn make_device(viewport: &Viewport, font_ctx: Arc<Mutex<FontContext>>) -> Device {
@@ -356,6 +360,8 @@ impl BaseDocument {
             navigation_provider,
             shell_provider,
             html_parser_provider,
+            #[cfg(feature = "svg")]
+            svg_image_resolver: config.svg_image_resolver,
         };
 
         // Initialise document with root Document node

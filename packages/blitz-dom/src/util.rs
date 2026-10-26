@@ -101,11 +101,18 @@ pub fn walk_tree(indent: usize, node: &Node) {
 }
 
 #[cfg(feature = "svg")]
-pub(crate) fn parse_svg(source: &[u8]) -> Result<usvg::Tree, usvg::Error> {
-    let options = usvg::Options {
+/// Parses an SVG. `resolver` resolves the hrefs of its `<image>` elements; `None` is usvg's default resolver.
+pub(crate) fn parse_svg(
+    source: &[u8],
+    resolver: Option<usvg::ImageHrefResolver<'static>>,
+) -> Result<usvg::Tree, usvg::Error> {
+    let mut options = usvg::Options {
         fontdb: Arc::clone(&*FONT_DB),
         ..Default::default()
     };
+    if let Some(resolver) = resolver {
+        options.image_href_resolver = resolver;
+    }
 
     let tree = usvg::Tree::from_data(source, &options)?;
     Ok(tree)
