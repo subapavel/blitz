@@ -2219,6 +2219,40 @@ mod pseudo_tests {
         assert_eq!(*got, *children);
     }
 
+    /// html-to-pdf F163c: a table's layout children are its cells in the order of its grid items (visual order),
+    /// whatever their `order`: a `display: table-cell` `::before` (order `i32::MIN`) or `::after` (`i32::MAX`), or
+    /// an author `order` on a cell, does not move a cell in front of the header cells or behind the footer cells.
+    #[test]
+    fn a_tables_layout_children_stay_in_visual_order_whatever_their_order() {
+        let group = |tag, name, cell, text| E(tag, name, "", vec![row("r", cell, text)]);
+        let cases = [
+            "table::before { content: \"B\"; display: table-cell }",
+            "table::after { content: \"A\"; display: table-cell }",
+            "table::before { content: \"B\"; display: table-cell } table::after { content: \"A\"; display: table-cell }",
+            "#cb { order: -1 } #ch { order: 5 }",
+        ];
+        for css in cases {
+            let t = table(
+                "t",
+                vec![
+                    group("thead", "h", "ch", "H"),
+                    group("tbody", "b", "cb", "body"),
+                    group("tfoot", "f", "cf", "F"),
+                ],
+            );
+            let (doc, i) = resolved(css, vec![t]);
+            let cells: Vec<usize> = context(&doc, i["t"])
+                .items
+                .iter()
+                .filter(|item| item.kind == TableItemKind::Cell)
+                .map(|item| item.node_id)
+                .collect();
+            assert_eq!(layout_children(&doc, i["t"]), cells, "{css}");
+            assert_eq!(cells.first(), Some(&i["ch"]), "{css}");
+            assert_eq!(cells.last(), Some(&i["cf"]), "{css}");
+        }
+    }
+
     #[test]
     fn resolving_twice_gives_the_same_table() {
         let (mut doc, i) = resolved(BOTH, vec![table("t", vec![row("r", "c", "b")])]);

@@ -431,8 +431,14 @@ impl BaseDocument {
                 self.flush_styles_to_layout(*child);
             }
 
-            // If the node is a Flexbox or Grid node then sort by css order property
-            if matches!(display, taffy::Display::Flex | taffy::Display::Grid) {
+            // If the node is a Flexbox or Grid node then sort by css order property.
+            // html-to-pdf F163c: not a table root. Its layout children are its cells in visual order (F36:
+            // header group first, footer group last), which Taffy does not read (it places cells by their grid
+            // lines) but fulgur's fragmenter and header repeat do. `order` does not apply to table parts, and a
+            // `display: table-cell` `::before` (order `i32::MIN`) would be moved in front of the header cells.
+            if matches!(display, taffy::Display::Flex | taffy::Display::Grid)
+                && !self.nodes[node_id].flags.is_table_root()
+            {
                 children.sort_by(|left, right| {
                     let left_node = self.nodes.get(*left).unwrap();
                     let right_node = self.nodes.get(*right).unwrap();
