@@ -98,6 +98,11 @@ pub(crate) fn text_wrap_nowrap(input: &stylo::ComputedValues) -> bool {
     input.get_inherited_text().text_wrap_mode == stylo::TextWrapMode::Nowrap
 }
 
+/// Whether `line-height` is `normal` (the style conversion maps it to 1.2 em, which hides it).
+pub(crate) fn line_height_is_normal(input: &stylo::ComputedValues) -> bool {
+    matches!(input.get_font().line_height, stylo::LineHeight::Normal)
+}
+
 pub(crate) fn style(
     span_id: usize,
     style: &stylo::ComputedValues,

@@ -912,6 +912,9 @@ pub(crate) fn build_inline_layout_into(
         .unwrap_or_default();
 
     let root_line_height = resolve_line_height(parley_style.line_height, parley_style.font_size);
+    let line_height_normal = root_node_style
+        .as_ref()
+        .is_some_and(|s| stylo_to_parley::line_height_is_normal(s));
 
     // The inline formatting context is recorded as a list of ops first: white space is collapsed across the
     // boundaries of its elements (`whitespace.rs`) before Parley sees the text.
@@ -1020,6 +1023,29 @@ pub(crate) fn build_inline_layout_into(
         );
     }
 
+    // The strut of the block (CSS 2.1 section 10.8.1), only for a context with a baseline-aligned box: Parley keeps
+    // it on the lines that hold one. Other contexts do not need it, and their lines are computed as before.
+    let needs_strut = ops.iter().any(|op| {
+        matches!(
+            op,
+            InlineOp::InlineBox {
+                baseline_aligned: true,
+                ..
+            }
+        )
+    });
+    let strut = if needs_strut {
+        root_strut(
+            font_ctx,
+            &parley_style,
+            root_line_height,
+            line_height_normal,
+            scale,
+        )
+    } else {
+        None
+    };
+
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
     // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
@@ -1027,6 +1053,7 @@ pub(crate) fn build_inline_layout_into(
     replay(collapse_white_space(ops), &mut builder);
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    text_layout.layout.set_strut(strut);
     return;
 
     /// Whether a `display: contents` element needs a style span of its own in an inline layout. It does not when
@@ -1150,7 +1177,10 @@ pub(crate) fn build_inline_layout_into(
                             || *tag_name == local_name!("textarea")
                             || *tag_name == local_name!("button")
                         {
-                            ops.push(InlineOp::InlineBox(node_id as u64));
+                            ops.push(InlineOp::InlineBox {
+                                id: node_id as u64,
+                                baseline_aligned: strut_box(node),
+                            });
                         } else if *tag_name == local_name!("br") {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             // TODO: update span id for br spans
@@ -1198,7 +1228,10 @@ pub(crate) fn build_inline_layout_into(
                     }
                     // Inline box
                     (_, _) => {
-                        ops.push(InlineOp::InlineBox(node_id as u64));
+                        ops.push(InlineOp::InlineBox {
+                            id: node_id as u64,
+                            baseline_aligned: strut_box(node),
+                        });
                     }
                 };
             }
@@ -1227,6 +1260,88 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document => unreachable!(),
         }
     }
+}
+
+/// Whether `node` is a replaced element that Parley lays out as a baseline-aligned inline box (CSS 2.1 section
+/// 10.8.1: its bottom margin edge sits on the baseline, the strut of the block stays below it): an `<img>` or an
+/// inline `<svg>` with an inline-level `display` (an out-of-flow or floated box is blockified, so `abspos` and
+/// `float` are excluded by it) and `vertical-align: baseline`. The other values (`top`, `middle`, a length ...)
+/// and other atomic inlines (inline-blocks, form controls) keep the old line computation.
+fn strut_box(node: &Node) -> bool {
+    use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
+
+    let Some(element) = node.element_data() else {
+        return false;
+    };
+    if !(element.name.local == local_name!("img") || element.name.local == local_name!("svg")) {
+        return false;
+    }
+    node.primary_styles().is_some_and(|styles| {
+        styles.clone_display().outside() == DisplayOutside::Inline
+            && matches!(
+                styles.clone_vertical_align(),
+                VerticalAlign::Keyword(VerticalAlignKeyword::Baseline)
+            )
+    })
+}
+
+/// The strut of an inline formatting context's root (CSS 2.1 section 10.8.1, css-inline-3 section 2): the first
+/// available font of the root's `font-family` (css-fonts-4 section 5) at the root's `font-size`, with the root's
+/// line height. The font is found like Parley finds it for text, and the metrics come from the same source as the
+/// ones of a text run (`skrifa` at the font size; no variations). `line-height: normal` is Chrome's: the ascent, the
+/// descent and the line gap each rounded to whole pixels, then added. All values are in layout units (`scale`).
+///
+/// Returns `None` when no font of the stack is available (the lines keep their old height then).
+fn root_strut(
+    font_ctx: &mut FontContext,
+    style: &parley::TextStyle<'static, TextBrush>,
+    line_height: f32,
+    line_height_normal: bool,
+    scale: f32,
+) -> Option<parley::Strut> {
+    use parley::fontique::{Attributes, QueryFamily, QueryStatus};
+    use parley::{FontFamily, FontStack};
+
+    let families: Vec<FontFamily<'_>> = match &style.font_stack {
+        FontStack::Source(source) => FontFamily::parse_list(source).collect(),
+        FontStack::Single(family) => vec![family.clone()],
+        FontStack::List(list) => list.to_vec(),
+    };
+    let mut query = font_ctx.collection.query(&mut font_ctx.source_cache);
+    query.set_families(families.iter().map(|family| match family {
+        FontFamily::Named(name) => QueryFamily::Named(name),
+        FontFamily::Generic(generic) => QueryFamily::Generic(*generic),
+    }));
+    query.set_attributes(Attributes {
+        width: style.font_width,
+        weight: style.font_weight,
+        style: style.font_style,
+    });
+    let mut found = None;
+    query.matches_with(|font| {
+        found = Some((font.blob.clone(), font.index));
+        QueryStatus::Stop
+    });
+    let (blob, index) = found?;
+
+    let font = skrifa::FontRef::from_index(blob.as_ref(), index).ok()?;
+    let font_size = style.font_size * scale;
+    let metrics = skrifa::metrics::Metrics::new(
+        &font,
+        skrifa::prelude::Size::new(font_size),
+        skrifa::instance::LocationRef::default(),
+    );
+    let (ascent, descent) = (metrics.ascent, -metrics.descent);
+    let line_height = if line_height_normal {
+        ascent.round() + descent.round() + metrics.leading.round()
+    } else {
+        line_height * scale
+    };
+    Some(parley::Strut {
+        ascent,
+        descent,
+        line_height,
+    })
 }
 
 /// The combining diacritical mark blocks (enough for decomposed Latin, Greek and Cyrillic text).
@@ -2144,5 +2259,150 @@ mod svg_options_tests {
         assert!(!asked.is_empty(), "the resolver is asked");
         assert!(asked[0].contains("Nobody Has This"), "{asked:?}");
         assert_eq!(texts(&doc, svg), 0);
+    }
+}
+
+/// A replaced inline element with `vertical-align: baseline` sits on the baseline of a line that keeps the strut of its
+/// block (CSS 2.1 section 10.8.1): `<div><img height=60></div>` is 60 px plus the strut's descent tall, not 60.
+#[cfg(test)]
+mod strut_tests {
+    use parley::FontContext;
+    use parley::fontique::Blob;
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, ns};
+
+    /// A font that has a glyph for U+2022 (the bullet) and nothing else worth naming; its metrics are the strut's.
+    const FONT: &[u8] = include_bytes!("../../assets/moz-bullet-font.otf");
+
+    fn attr(name: &str, value: &str) -> Attribute {
+        Attribute {
+            name: QualName::new(None, ns!(), name.into()),
+            value: value.to_string(),
+        }
+    }
+
+    /// The registered family of `FONT`.
+    fn font_context() -> (FontContext, String) {
+        let mut font_ctx = FontContext::default();
+        let registered = font_ctx
+            .collection
+            .register_fonts(Blob::from(FONT.to_vec()), None);
+        let name = font_ctx
+            .collection
+            .family_name(registered[0].0)
+            .expect("the family has a name")
+            .to_string();
+        (font_ctx, name)
+    }
+
+    /// The strut's descent below the baseline for `line-height: normal` at `size` px: Chrome's rounded ascent,
+    /// descent and line gap are added up, so the leading is zero and the descent stays.
+    fn expected_descent(size: f32) -> f32 {
+        let font = skrifa::FontRef::new(FONT).unwrap();
+        let metrics = skrifa::metrics::Metrics::new(
+            &font,
+            skrifa::prelude::Size::new(size),
+            skrifa::instance::LocationRef::default(),
+        );
+        (-metrics.descent).round()
+    }
+
+    /// `<div id="d" style="font: {size}px {family}; {div_style}">{inside}</div>` in `<body>`; `inside` builds the
+    /// children of the div. Returns the document and the ids of the div and of its first `<img>`/`<span>` child.
+    fn laid_out(
+        div_style: &str,
+        text: Option<&str>,
+        child_tag: &str,
+        child_style: &str,
+    ) -> (BaseDocument, usize, usize) {
+        let (font_ctx, family) = font_context();
+        let mut doc = BaseDocument::new(DocumentConfig {
+            font_ctx: Some(font_ctx),
+            ..Default::default()
+        });
+        let (div, child);
+        {
+            let mut m = doc.mutate();
+            let html_name = |n: &str| QualName::new(None, ns!(html), n.into());
+            let html = m.create_element(html_name("html"), vec![]);
+            let body =
+                m.create_element(html_name("body"), vec![attr("style", "margin:0;padding:0")]);
+            div = m.create_element(
+                html_name("div"),
+                vec![attr(
+                    "style",
+                    &format!("font:16px '{family}';width:400px;{div_style}"),
+                )],
+            );
+            let mut attrs = vec![attr("width", "60"), attr("height", "60")];
+            if !child_style.is_empty() {
+                attrs.push(attr("style", child_style));
+            }
+            child = m.create_element(html_name(child_tag), attrs);
+            let mut kids = Vec::new();
+            if let Some(text) = text {
+                kids.push(m.create_text_node(text));
+            }
+            kids.push(child);
+            m.append_children(div, &kids);
+            m.append_children(body, &[div]);
+            m.append_children(html, &[body]);
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, div, child)
+    }
+
+    fn height(doc: &BaseDocument, id: usize) -> f32 {
+        doc.nodes[id].final_layout.size.height
+    }
+
+    #[test]
+    fn an_inline_img_keeps_the_strut_below_the_baseline() {
+        let (doc, div, img) = laid_out("", None, "img", "");
+        let descent = expected_descent(16.0);
+        assert!(descent >= 1.0, "the test font has a descent: {descent}");
+        assert_eq!(height(&doc, div), 60.0 + descent);
+        assert_eq!(doc.nodes[img].final_layout.location.y, 0.0);
+    }
+
+    #[test]
+    fn the_other_vertical_aligns_and_block_images_have_no_strut() {
+        for style in [
+            "vertical-align:middle",
+            "vertical-align:top",
+            "vertical-align:bottom",
+            "display:block",
+        ] {
+            let (doc, div, _) = laid_out("", None, "img", style);
+            assert_eq!(height(&doc, div), 60.0, "{style}");
+        }
+    }
+
+    #[test]
+    fn an_inline_block_is_not_a_strut_box() {
+        let (doc, div, _) = laid_out(
+            "",
+            None,
+            "span",
+            "display:inline-block;width:60px;height:60px",
+        );
+        assert_eq!(height(&doc, div), 60.0);
+    }
+
+    #[test]
+    fn an_img_with_text_starts_at_the_line_top() {
+        // Before the fix the strut's half-leading was added on top of the box: the image started above the line.
+        let (doc, div, img) = laid_out("", Some("Dodavatel"), "img", "");
+        assert_eq!(doc.nodes[img].final_layout.location.y, 0.0);
+        // The text falls back to another font (the test font has no letters): its descent may be larger than the
+        // strut's, never smaller.
+        assert!(height(&doc, div) >= 60.0 + expected_descent(16.0));
+    }
+
+    #[test]
+    fn an_absolutely_positioned_img_adds_no_line() {
+        let (doc, div, _) = laid_out("", None, "img", "position:absolute;left:100px;top:100px");
+        assert_eq!(height(&doc, div), 0.0);
     }
 }

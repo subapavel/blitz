@@ -31,8 +31,13 @@ pub(crate) enum InlineOp<'a> {
     /// The marker of a `list-style-position: inside` item. It is pushed as it is, and a space at its end
     /// collapses with the white space that follows.
     Marker(String),
-    /// An atomic inline: `<img>`, an inline-block, a form control.
-    InlineBox(u64),
+    /// An atomic inline: `<img>`, an inline-block, a form control. `baseline_aligned` is set for a replaced
+    /// element (`<img>`, inline `<svg>`) with `vertical-align: baseline`: Parley then keeps the block's strut
+    /// on its line (see `strut_box` in `construct.rs`).
+    InlineBox {
+        id: u64,
+        baseline_aligned: bool,
+    },
     /// A `<br>` or a segment break of `white-space: pre-line`.
     ForcedBreak,
 }
@@ -197,7 +202,7 @@ pub(crate) fn collapse_white_space<'a>(ops: Vec<InlineOp<'a>>) -> Vec<InlineOp<'
                 c.last_space = None;
                 c.out.push(InlineOp::Marker(text));
             }
-            InlineOp::InlineBox(_) => {
+            InlineOp::InlineBox { .. } => {
                 c.prev = Prev::Other;
                 c.last_space = None;
                 c.out.push(op);
@@ -226,13 +231,17 @@ pub(crate) fn replay(ops: Vec<InlineOp<'_>>, builder: &mut TreeBuilder<'_, TextB
                 builder.push_text(&transform_text(&text, case));
             }
             InlineOp::Marker(text) => builder.push_text(&text),
-            InlineOp::InlineBox(id) => builder.push_inline_box(InlineBox {
+            InlineOp::InlineBox {
+                id,
+                baseline_aligned,
+            } => builder.push_inline_box(InlineBox {
                 id,
                 // Overridden by push_inline_box method
                 index: 0,
                 // Width and height are set during layout
                 width: 0.0,
                 height: 0.0,
+                baseline_aligned,
             }),
             InlineOp::ForcedBreak => {
                 // The empty span commits the text before the break on its own, so the break is a run of its own.
@@ -252,6 +261,12 @@ mod tests {
 
     use stylo::WhiteSpaceCollapse as W;
 
+    fn inline_box() -> InlineOp<'static> {
+        InlineOp::InlineBox {
+            id: 1,
+            baseline_aligned: false,
+        }
+    }
     fn t(text: &str) -> InlineOp<'_> {
         InlineOp::Text {
             text: Cow::Borrowed(text),
@@ -289,7 +304,7 @@ mod tests {
                 InlineOp::PopSpan => "]".to_string(),
                 InlineOp::Text { text, .. } => text.to_string(),
                 InlineOp::Marker(text) => format!("M({text})"),
-                InlineOp::InlineBox(_) => "<box>".to_string(),
+                InlineOp::InlineBox { .. } => "<box>".to_string(),
                 InlineOp::ForcedBreak => "<br>".to_string(),
             })
             .collect()
@@ -433,14 +448,11 @@ mod tests {
     #[test]
     fn w9_atomic_inlines_are_content() {
         // a <img> b
-        assert_eq!(
-            show(vec![t("a "), InlineOp::InlineBox(1), t(" b")]),
-            "a <box> b"
-        );
+        assert_eq!(show(vec![t("a "), inline_box(), t(" b")]), "a <box> b");
         // <img> at the start, a space at the end of the line
-        assert_eq!(show(vec![InlineOp::InlineBox(1), t(" ")]), "<box>");
+        assert_eq!(show(vec![inline_box(), t(" ")]), "<box>");
         assert_eq!(
-            show(vec![InlineOp::InlineBox(1), t(" "), InlineOp::ForcedBreak]),
+            show(vec![inline_box(), t(" "), InlineOp::ForcedBreak]),
             "<box><br>"
         );
     }
