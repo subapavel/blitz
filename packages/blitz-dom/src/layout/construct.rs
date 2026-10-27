@@ -1268,15 +1268,23 @@ pub(crate) fn build_inline_layout_into(
 
 /// Whether the inline formatting context rooted at `root_id` sits inside an atomic inline-level box: the root or one
 /// of its ancestors has an inline-level outside display with an inside other than `flow` (`inline-block`,
-/// `inline-flex`, `inline-grid`, `inline-table`; a `<button>` is an `inline-block`).
+/// `inline-flex`, `inline-grid`, `inline-table`), or is an inline-level `<button>` / `<textarea>` / `<input>`, which
+/// the inline layout above treats as an atomic inline whatever their `display` inside is.
 fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
     let mut current = Some(root_id);
     while let Some(id) = current {
         let node = &nodes[id];
-        if node.display_style().is_some_and(|display| {
-            display.outside() == DisplayOutside::Inline && display.inside() != DisplayInside::Flow
-        }) {
-            return true;
+        if let Some(display) = node.display_style() {
+            if display.outside() == DisplayOutside::Inline
+                && (display.inside() != DisplayInside::Flow
+                    || node.element_data().is_some_and(|el| {
+                        el.name.local == local_name!("button")
+                            || el.name.local == local_name!("textarea")
+                            || el.name.local == local_name!("input")
+                    }))
+            {
+                return true;
+            }
         }
         current = node.parent;
     }
