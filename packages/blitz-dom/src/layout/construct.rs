@@ -1025,6 +1025,10 @@ pub(crate) fn build_inline_layout_into(
 
     // The strut of the block (CSS 2.1 section 10.8.1), only for a context with a baseline-aligned box: Parley keeps
     // it on the lines that hold one. Other contexts do not need it, and their lines are computed as before.
+    //
+    // Not inside an atomic inline (`inline-block`, `inline-flex`, `<button>` ...): the outer line puts the bottom of
+    // such a box on its baseline instead of the baseline of its last line (html-to-pdf F183b), so the image would be
+    // drawn the strut's descent too low. Until that is fixed those contexts keep the old line computation.
     let needs_strut = ops.iter().any(|op| {
         matches!(
             op,
@@ -1033,7 +1037,7 @@ pub(crate) fn build_inline_layout_into(
                 ..
             }
         )
-    });
+    }) && !inside_atomic_inline(nodes, inline_context_root_node_id);
     let strut = if needs_strut {
         root_strut(
             font_ctx,
@@ -1260,6 +1264,23 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document => unreachable!(),
         }
     }
+}
+
+/// Whether the inline formatting context rooted at `root_id` sits inside an atomic inline-level box: the root or one
+/// of its ancestors has an inline-level outside display with an inside other than `flow` (`inline-block`,
+/// `inline-flex`, `inline-grid`, `inline-table`; a `<button>` is an `inline-block`).
+fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
+    let mut current = Some(root_id);
+    while let Some(id) = current {
+        let node = &nodes[id];
+        if node.display_style().is_some_and(|display| {
+            display.outside() == DisplayOutside::Inline && display.inside() != DisplayInside::Flow
+        }) {
+            return true;
+        }
+        current = node.parent;
+    }
+    false
 }
 
 /// Whether `node` is a replaced element that Parley lays out as a baseline-aligned inline box (CSS 2.1 section
@@ -2388,6 +2409,17 @@ mod strut_tests {
             "display:inline-block;width:60px;height:60px",
         );
         assert_eq!(height(&doc, div), 60.0);
+    }
+
+    #[test]
+    fn an_img_inside_an_inline_block_has_no_strut_until_f183b() {
+        // The outer line puts the bottom of an inline-block on its baseline, not the baseline of its last line, so a
+        // strut inside would draw the image its descent too low: the context keeps the old line computation.
+        for div_style in ["display:inline-block", "display:inline-block;line-height:0"] {
+            let (doc, div, img) = laid_out(div_style, None, "img", "");
+            assert_eq!(height(&doc, div), 60.0, "{div_style}");
+            assert_eq!(doc.nodes[img].final_layout.location.y, 0.0, "{div_style}");
+        }
     }
 
     #[test]
