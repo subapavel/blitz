@@ -28,7 +28,7 @@ use super::{
     damage::ALL_DAMAGE,
     list::collect_list_item_children,
     table::build_table_context,
-    whitespace::{InlineOp, collapse_white_space, replay},
+    whitespace::{InlineOp, collapse_white_space, line_content_after_last_break, replay},
 };
 
 use style::values::specified::text::TextTransformCase;
@@ -1054,7 +1054,9 @@ pub(crate) fn build_inline_layout_into(
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
     // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
     AT_WORD_START.with(|w| w.set(true));
-    replay(collapse_white_space(ops), &mut builder);
+    let ops = collapse_white_space(ops);
+    text_layout.content_after_last_break = line_content_after_last_break(&ops);
+    replay(ops, &mut builder);
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
     text_layout.layout.set_strut(strut);
@@ -1193,6 +1195,9 @@ pub(crate) fn build_inline_layout_into(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = inline_span_style(node, root_line_height);
 
+                            if *tag_name == local_name!("wbr") || has_inline_axis_pbm(node) {
+                                ops.push(InlineOp::LineContent);
+                            }
                             ops.push(InlineOp::PushSpan(style));
 
                             if let Some(before_id) = node.before {
@@ -1289,6 +1294,40 @@ fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
         current = node.parent;
     }
     false
+}
+
+/// Whether an inline element has a non-zero margin, padding or border on the left or the right (CSS 2.1 §9.4.2: the
+/// reason for a line box that holds nothing else not to be zero-height). Vertical ones do not count, nor an `auto`
+/// margin (zero on an inline box); a percentage or `calc()` counts as non-zero.
+fn has_inline_axis_pbm(node: &Node) -> bool {
+    fn non_zero(len: taffy::CompactLength) -> bool {
+        match len.tag() {
+            taffy::CompactLength::LENGTH_TAG | taffy::CompactLength::PERCENT_TAG => {
+                len.value() != 0.0
+            }
+            taffy::CompactLength::AUTO_TAG => false,
+            _ => true,
+        }
+    }
+    let Some(styles) = node.primary_styles() else {
+        return false;
+    };
+    let (margin, padding, border) = (
+        styles.get_margin(),
+        styles.get_padding(),
+        styles.get_border(),
+    );
+    let length = |px: f32| taffy::LengthPercentage::length(px).into_raw();
+    [
+        stylo_taffy::convert::margin(&margin.margin_left).into_raw(),
+        stylo_taffy::convert::margin(&margin.margin_right).into_raw(),
+        stylo_taffy::convert::length_percentage(&padding.padding_left.0).into_raw(),
+        stylo_taffy::convert::length_percentage(&padding.padding_right.0).into_raw(),
+        length(border.border_left_width.to_f32_px()),
+        length(border.border_right_width.to_f32_px()),
+    ]
+    .into_iter()
+    .any(non_zero)
 }
 
 /// Whether `node` is a replaced element that Parley lays out as a baseline-aligned inline box (CSS 2.1 section

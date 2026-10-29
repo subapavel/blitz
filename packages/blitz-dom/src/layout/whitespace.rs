@@ -40,6 +40,26 @@ pub(crate) enum InlineOp<'a> {
     },
     /// A `<br>` or a segment break of `white-space: pre-line`.
     ForcedBreak,
+    /// An inline box that has no content of its own but keeps its line from being zero-height (CSS 2.1 §9.4.2): the
+    /// start of an inline element with non-zero inline-axis margin, padding or border, or a `<wbr>`. It adds nothing
+    /// to the text and is transparent for white space; [`line_content_after_last_break`] reads it.
+    LineContent,
+}
+
+/// Whether the last line of the context, the one that follows its last forced break, holds an [`InlineOp::LineContent`]
+/// box: `a<br><span style="padding: 0 4px"></span>`. `ops` is the output of [`collapse_white_space`]. A preserved
+/// newline at the end of a text ends the line like a `<br>`.
+pub(crate) fn line_content_after_last_break(ops: &[InlineOp<'_>]) -> bool {
+    let mut content = false;
+    for op in ops {
+        match op {
+            InlineOp::LineContent => content = true,
+            InlineOp::ForcedBreak => content = false,
+            InlineOp::Text { text, .. } if text.ends_with(['\n', '\r']) => content = false,
+            _ => {}
+        }
+    }
+    content
 }
 
 /// What the last thing emitted was, for the purpose of collapsing.
@@ -170,7 +190,7 @@ pub(crate) fn collapse_white_space<'a>(ops: Vec<InlineOp<'a>>) -> Vec<InlineOp<'
     for op in ops {
         match op {
             // Spans are transparent: the space inside a span and the one outside it collapse.
-            InlineOp::PushSpan(_) | InlineOp::PopSpan => c.out.push(op),
+            InlineOp::PushSpan(_) | InlineOp::PopSpan | InlineOp::LineContent => c.out.push(op),
             InlineOp::Text {
                 text,
                 collapse,
@@ -243,6 +263,8 @@ pub(crate) fn replay(ops: Vec<InlineOp<'_>>, builder: &mut TreeBuilder<'_, TextB
                 height: 0.0,
                 baseline_aligned,
             }),
+            // Nothing for Parley: the box has no text. `line_content_after_last_break` has read it.
+            InlineOp::LineContent => {}
             InlineOp::ForcedBreak => {
                 // The empty span commits the text before the break on its own, so the break is a run of its own.
                 builder.push_style_modification_span(&[]);
@@ -306,8 +328,44 @@ mod tests {
                 InlineOp::Marker(text) => format!("M({text})"),
                 InlineOp::InlineBox { .. } => "<box>".to_string(),
                 InlineOp::ForcedBreak => "<br>".to_string(),
+                InlineOp::LineContent => "<content>".to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn line_content_is_transparent_for_white_space_and_found_after_the_last_break() {
+        // a<br><span style=padding> </span>: the space is collapsed away at the line start, the box stays.
+        let ops = vec![
+            t("a"),
+            InlineOp::ForcedBreak,
+            InlineOp::LineContent,
+            open(),
+            t(" "),
+            close(),
+        ];
+        let collapsed = collapse_white_space(ops);
+        assert!(line_content_after_last_break(&collapsed));
+        // The box before the break is on the line that the break ends.
+        let before = collapse_white_space(vec![
+            InlineOp::LineContent,
+            open(),
+            t("a"),
+            InlineOp::ForcedBreak,
+            close(),
+        ]);
+        assert!(!line_content_after_last_break(&before));
+        // A preserved newline at the end of a text ends the line like a `<br>`.
+        let pre = vec![
+            InlineOp::LineContent,
+            InlineOp::Text {
+                text: "a\n".into(),
+                collapse: W::Preserve,
+                case: None,
+            },
+        ];
+        assert!(!line_content_after_last_break(&collapse_white_space(pre)));
+        assert!(!line_content_after_last_break(&[]));
     }
 
     #[test]

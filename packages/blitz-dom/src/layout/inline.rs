@@ -34,6 +34,7 @@ fn break_lines(
     text: &str,
     width: f32,
     nowrap: bool,
+    content_after_last_break: bool,
 ) {
     // Parley's `Whitespace::Newline`: `\n` and `\r` (a `\r\n` pair is one cluster).
     let ends_in_newline = text.ends_with(['\n', '\r']);
@@ -44,7 +45,8 @@ fn break_lines(
     while let Some((advance, _)) = breaker.break_next(width) {
         if breaker.is_done()
             && advance == 0.0
-            && (previous_overflowed || (ends_in_newline && !box_after_text))
+            && (previous_overflowed
+                || (ends_in_newline && !box_after_text && !content_after_last_break))
         {
             breaker.revert();
             break;
@@ -174,7 +176,13 @@ impl BaseDocument {
                     //
                     // FIXME: avoid the need to clone the layout each time
                     let mut layout = inline_layout.clone();
-                    break_lines(&mut layout.layout, &layout.text, width, layout.nowrap);
+                    break_lines(
+                        &mut layout.layout,
+                        &layout.text,
+                        width,
+                        layout.nowrap,
+                        layout.content_after_last_break,
+                    );
 
                     return taffy::Size {
                         width: width.ceil() / scale,
@@ -188,6 +196,7 @@ impl BaseDocument {
                     &inline_layout.text,
                     width,
                     inline_layout.nowrap,
+                    inline_layout.content_after_last_break,
                 );
 
                 let alignment = self.nodes[node_id]
@@ -464,6 +473,66 @@ mod trailing_forced_break_tests {
         let ib = || E("span", "display:inline-block;width:0;height:30px", vec![]);
         let (n, _) = lines("normal", vec![T("a"), br(), ib()]);
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn an_inline_box_with_inline_axis_margin_padding_or_border_after_the_break_keeps_the_line() {
+        // CSS 2.1 §9.4.2: a line with an inline element with non-zero margin, padding or border is not zero-height.
+        for style in [
+            "padding:0 4px",
+            "padding-left:3px",
+            "border-left:1px solid #000",
+            "border-right:2px solid #000",
+            "margin:0 4px",
+            "margin-right:5px",
+            "padding:1%",
+        ] {
+            let span = || E("span", style, vec![]);
+            let (n, h) = lines("normal", vec![T("a"), br(), span()]);
+            assert_eq!((n, h), (2, 40.0), "<span style=\"{style}\"> after the br");
+            // White space in it collapses away; the box still holds the line.
+            let (n, _) = lines("normal", vec![T("a"), br(), E("span", style, vec![T(" ")])]);
+            assert_eq!(n, 2, "<span style=\"{style}\"> </span> after the br");
+        }
+        // Under `pre` the preserved newline ends the line the same way.
+        let (n, _) = lines("pre", vec![T("a\n"), E("span", "padding:0 4px", vec![])]);
+        assert_eq!(n, 2, "pre");
+        // `<wbr>`, one or several.
+        let (n, _) = lines("normal", vec![T("a"), br(), E("wbr", "", vec![])]);
+        assert_eq!(n, 2, "wbr");
+        let (n, _) = lines(
+            "normal",
+            vec![T("a"), br(), E("wbr", "", vec![]), E("wbr", "", vec![])],
+        );
+        assert_eq!(n, 2, "two wbr");
+    }
+
+    #[test]
+    fn an_inline_box_without_inline_axis_margin_padding_or_border_after_the_break_is_no_line() {
+        for style in [
+            "",
+            "padding:4px 0",
+            "margin:4px 0",
+            "margin:0 auto",
+            "padding:0",
+            "border-left:0 solid #000",
+            "border-left:3px none #000",
+        ] {
+            let (n, _) = lines("normal", vec![T("a"), br(), E("span", style, vec![])]);
+            assert_eq!(n, 1, "<span style=\"{style}\"> after the br");
+        }
+        // The closing edge of a padded span that ends in the break is not a line either (Chrome).
+        let (n, _) = lines(
+            "normal",
+            vec![T("a"), br(), E("span", "padding:0 4px", vec![T("x"), br()])],
+        );
+        assert_eq!(n, 2);
+        // The box before the break is on the line the break ends.
+        let (n, _) = lines(
+            "normal",
+            vec![T("a"), E("span", "padding:0 4px", vec![]), br()],
+        );
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -546,6 +546,10 @@ pub struct TextLayout {
     /// lines break only at forced breaks. Parley 0.6 has no wrap-mode style, so layout breaks the lines at
     /// an unbounded width instead and reports the max-content width as the min-content width.
     pub nowrap: bool,
+    /// An inline box with non-zero inline-axis margin, padding or border, or a `<wbr>`, starts on the line after the
+    /// last forced break, and no text follows it. That line is not zero-height (CSS 2.1 §9.4.2): the layout keeps it
+    /// although it holds no glyph.
+    pub content_after_last_break: bool,
 }
 
 impl TextLayout {
