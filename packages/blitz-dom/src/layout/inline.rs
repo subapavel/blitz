@@ -536,6 +536,145 @@ mod trailing_forced_break_tests {
     }
 
     #[test]
+    fn an_open_inline_box_with_an_end_edge_keeps_the_line_when_a_box_starts_after_the_break() {
+        // Chrome (m141, measured): the end edge of `<span style="padding-right:4px">a<br><span></span></span>` lands on
+        // the line after the break, where it is inline content, so that line is not zero-height. Only the end side of
+        // the box counts, and the end side follows the direction of the box itself.
+        for style in [
+            "padding-right:4px",
+            "margin-right:4px",
+            "border-right:1px solid #000",
+            "margin-right:-4px",
+            "padding-right:1%",
+            "direction:rtl;padding-left:4px",
+            "direction:rtl;margin-left:4px",
+        ] {
+            let mut cases: Vec<(&str, &str, Vec<N>)> = vec![
+                (
+                    "normal",
+                    "empty span",
+                    vec![T("a"), br(), E("span", "", vec![])],
+                ),
+                (
+                    "normal",
+                    "empty <i>",
+                    vec![T("a"), br(), E("i", "", vec![])],
+                ),
+                (
+                    "normal",
+                    "span with a nested empty span",
+                    vec![T("a"), br(), E("span", "", vec![E("b", "", vec![])])],
+                ),
+                (
+                    "normal",
+                    "white space around the empty span",
+                    vec![T("a"), br(), T(" "), E("span", "", vec![]), T(" ")],
+                ),
+                (
+                    "normal",
+                    "two breaks",
+                    vec![T("a"), br(), br(), E("span", "", vec![])],
+                ),
+            ];
+            cases.push((
+                "pre",
+                "preserved newline",
+                vec![T("a\n"), E("span", "", vec![])],
+            ));
+            for (white_space, name, kids) in cases {
+                let (n, h) = lines(white_space, vec![E("span", style, kids)]);
+                let expected = if name == "two breaks" { 3 } else { 2 };
+                assert_eq!(
+                    (n, h),
+                    (expected, 20.0 * expected as f32),
+                    "<span style=\"{style}\"> a<br> {name}"
+                );
+            }
+            // The box that holds the end edge need not be the one the break is in.
+            let (n, _) = lines(
+                "normal",
+                vec![E(
+                    "span",
+                    style,
+                    vec![E("b", "", vec![T("a"), br()]), E("span", "", vec![])],
+                )],
+            );
+            assert_eq!(n, 2, "<span style=\"{style}\"><b>a<br></b><span></span>");
+            let (n, _) = lines(
+                "normal",
+                vec![E(
+                    "span",
+                    style,
+                    vec![E("b", "", vec![T("a"), br(), E("span", "", vec![])])],
+                )],
+            );
+            assert_eq!(n, 2, "<span style=\"{style}\"><b>a<br><span></span></b>");
+        }
+    }
+
+    #[test]
+    fn an_end_edge_without_a_box_that_starts_after_the_break_is_no_line() {
+        // The close tags that follow the break directly belong to the line it ends (Chrome: no line).
+        let pad = "padding-right:4px";
+        let (n, _) = lines("normal", vec![E("span", pad, vec![T("a"), br()])]);
+        assert_eq!(n, 1, "<span pad>a<br></span>");
+        let (n, _) = lines(
+            "normal",
+            vec![E("span", "", vec![E("span", pad, vec![T("a"), br()])])],
+        );
+        assert_eq!(n, 1, "<span><span pad>a<br></span></span>");
+        // A box that starts after the end edge closed.
+        let (n, _) = lines(
+            "normal",
+            vec![E("span", pad, vec![T("a"), br()]), E("span", "", vec![])],
+        );
+        assert_eq!(n, 1, "<span pad>a<br></span><span></span>");
+        let (n, _) = lines(
+            "normal",
+            vec![E(
+                "span",
+                "",
+                vec![E("span", pad, vec![T("a"), br()]), E("span", "", vec![])],
+            )],
+        );
+        assert_eq!(n, 1, "<span><span pad>a<br></span><span></span></span>");
+        // White space that collapses away is no box.
+        let (n, _) = lines("normal", vec![E("span", pad, vec![T("a"), br(), T(" ")])]);
+        assert_eq!(n, 1, "<span pad>a<br> </span>");
+    }
+
+    #[test]
+    fn only_the_end_side_of_an_open_box_keeps_the_line_and_only_a_box_that_exists() {
+        for style in [
+            "",
+            "padding-left:4px",
+            "margin-left:4px",
+            "border-left:1px solid #000",
+            "padding-top:4px",
+            "padding:4px 0",
+            "margin-right:auto",
+            "padding-right:0",
+            "direction:rtl;padding-right:4px",
+            "direction:rtl;margin-right:4px",
+        ] {
+            let (n, _) = lines(
+                "normal",
+                vec![E("span", style, vec![T("a"), br(), E("span", "", vec![])])],
+            );
+            assert_eq!(n, 1, "<span style=\"{style}\">a<br><span></span></span>");
+        }
+        // Nothing after the break is a box: `display: none`, `display: contents`, a comment-like empty text.
+        let pad = "padding-right:4px";
+        for gone in ["display:none", "display:contents"] {
+            let (n, _) = lines(
+                "normal",
+                vec![E("span", pad, vec![T("a"), br(), E("span", gone, vec![])])],
+            );
+            assert_eq!(n, 1, "<span pad>a<br><span style=\"{gone}\"></span></span>");
+        }
+    }
+
+    #[test]
     fn collapsible_white_space_after_the_break_is_no_line() {
         check("normal", vec![T("a"), br(), T(" ")], 1);
         check("pre-line", vec![T("a\n   ")], 1);
