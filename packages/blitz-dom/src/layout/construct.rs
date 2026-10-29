@@ -1195,9 +1195,10 @@ pub(crate) fn build_inline_layout_into(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = inline_span_style(node, root_line_height);
 
-                            if *tag_name == local_name!("wbr") || has_inline_axis_pbm(node) {
-                                ops.push(InlineOp::LineContent);
-                            }
+                            let (start_edge, end_edge) = inline_axis_edges(node);
+                            ops.push(InlineOp::BoxStart {
+                                edge: start_edge || *tag_name == local_name!("wbr"),
+                            });
                             ops.push(InlineOp::PushSpan(style));
 
                             if let Some(before_id) = node.before {
@@ -1232,6 +1233,9 @@ pub(crate) fn build_inline_layout_into(
                                 );
                             }
 
+                            if end_edge {
+                                ops.push(InlineOp::EndEdge);
+                            }
                             ops.push(InlineOp::PopSpan);
                         }
                     }
@@ -1296,10 +1300,11 @@ fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
     false
 }
 
-/// Whether an inline element has a non-zero margin, padding or border on the left or the right (CSS 2.1 §9.4.2: the
-/// reason for a line box that holds nothing else not to be zero-height). Vertical ones do not count, nor an `auto`
-/// margin (zero on an inline box); a percentage or `calc()` counts as non-zero.
-fn has_inline_axis_pbm(node: &Node) -> bool {
+/// Whether an inline element has a non-zero margin, padding or border on its inline-start side and on its inline-end side
+/// (CSS 2.1 §9.4.2: the reason for a line box that holds nothing else not to be zero-height). Vertical ones do not count,
+/// nor an `auto` margin (zero on an inline box); a percentage or `calc()` counts as non-zero. The start side is the left
+/// one for `direction: ltr` and the right one for `rtl`, the direction being that of the box itself (Chrome).
+fn inline_axis_edges(node: &Node) -> (bool, bool) {
     fn non_zero(len: taffy::CompactLength) -> bool {
         match len.tag() {
             taffy::CompactLength::LENGTH_TAG | taffy::CompactLength::PERCENT_TAG => {
@@ -1310,7 +1315,7 @@ fn has_inline_axis_pbm(node: &Node) -> bool {
         }
     }
     let Some(styles) = node.primary_styles() else {
-        return false;
+        return (false, false);
     };
     let (margin, padding, border) = (
         styles.get_margin(),
@@ -1318,16 +1323,25 @@ fn has_inline_axis_pbm(node: &Node) -> bool {
         styles.get_border(),
     );
     let length = |px: f32| taffy::LengthPercentage::length(px).into_raw();
-    [
+    let left = [
         stylo_taffy::convert::margin(&margin.margin_left).into_raw(),
-        stylo_taffy::convert::margin(&margin.margin_right).into_raw(),
         stylo_taffy::convert::length_percentage(&padding.padding_left.0).into_raw(),
-        stylo_taffy::convert::length_percentage(&padding.padding_right.0).into_raw(),
         length(border.border_left_width.to_f32_px()),
+    ]
+    .into_iter()
+    .any(non_zero);
+    let right = [
+        stylo_taffy::convert::margin(&margin.margin_right).into_raw(),
+        stylo_taffy::convert::length_percentage(&padding.padding_right.0).into_raw(),
         length(border.border_right_width.to_f32_px()),
     ]
     .into_iter()
-    .any(non_zero)
+    .any(non_zero);
+    if styles.writing_mode.is_bidi_ltr() {
+        (left, right)
+    } else {
+        (right, left)
+    }
 }
 
 /// Whether `node` is a replaced element that Parley lays out as a baseline-aligned inline box (CSS 2.1 section

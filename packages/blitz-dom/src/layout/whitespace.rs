@@ -40,22 +40,40 @@ pub(crate) enum InlineOp<'a> {
     },
     /// A `<br>` or a segment break of `white-space: pre-line`.
     ForcedBreak,
-    /// An inline box that has no content of its own but keeps its line from being zero-height (CSS 2.1 §9.4.2): the
-    /// start of an inline element with non-zero inline-axis margin, padding or border, or a `<wbr>`. It adds nothing
-    /// to the text and is transparent for white space; [`line_content_after_last_break`] reads it.
-    LineContent,
+    /// The start of an inline element that generates a box (not `display: none` or `contents`). It adds nothing to the
+    /// text and is transparent for white space. `edge` is set when the start side of the box (or its whole self, a
+    /// `<wbr>`) is inline content: non-zero inline-axis margin, padding or border on the inline-start side. Read by
+    /// [`line_content_after_last_break`].
+    BoxStart {
+        edge: bool,
+    },
+    /// Pushed before the `PopSpan` of an inline element whose inline-end side has non-zero margin, padding or border: the
+    /// end edge of the box, which is inline content on the line where the box ends.
+    EndEdge,
 }
 
-/// Whether the last line of the context, the one that follows its last forced break, holds an [`InlineOp::LineContent`]
-/// box: `a<br><span style="padding: 0 4px"></span>`. `ops` is the output of [`collapse_white_space`]. A preserved
-/// newline at the end of a text ends the line like a `<br>`.
+/// Whether the last line of the context, the one that follows its last forced break, is not zero-height although it holds
+/// no glyph (CSS 2.1 §9.4.2). `ops` is the output of [`collapse_white_space`]. A preserved newline at the end of a text ends
+/// the line like a `<br>`. On that line:
+///
+/// - a box whose start side is inline content (`a<br><span style="padding: 0 4px"></span>`, a `<wbr>`) is content;
+/// - so is the end edge of any box, if some box started after the break before it: `<span style="padding-right: 4px">a<br>
+///   <span></span></span>`. The close tags that directly follow the break belong to the line it ends (Chrome), so the
+///   end edge of `<span style="padding-right: 4px">a<br></span>` is no content.
 pub(crate) fn line_content_after_last_break(ops: &[InlineOp<'_>]) -> bool {
     let mut content = false;
+    let mut box_started = false;
     for op in ops {
         match op {
-            InlineOp::LineContent => content = true,
-            InlineOp::ForcedBreak => content = false,
-            InlineOp::Text { text, .. } if text.ends_with(['\n', '\r']) => content = false,
+            InlineOp::BoxStart { edge } => {
+                content |= edge;
+                box_started = true;
+            }
+            InlineOp::EndEdge => content |= box_started,
+            InlineOp::ForcedBreak => (content, box_started) = (false, false),
+            InlineOp::Text { text, .. } if text.ends_with(['\n', '\r']) => {
+                (content, box_started) = (false, false);
+            }
             _ => {}
         }
     }
@@ -190,7 +208,10 @@ pub(crate) fn collapse_white_space<'a>(ops: Vec<InlineOp<'a>>) -> Vec<InlineOp<'
     for op in ops {
         match op {
             // Spans are transparent: the space inside a span and the one outside it collapse.
-            InlineOp::PushSpan(_) | InlineOp::PopSpan | InlineOp::LineContent => c.out.push(op),
+            InlineOp::PushSpan(_)
+            | InlineOp::PopSpan
+            | InlineOp::BoxStart { .. }
+            | InlineOp::EndEdge => c.out.push(op),
             InlineOp::Text {
                 text,
                 collapse,
@@ -264,7 +285,7 @@ pub(crate) fn replay(ops: Vec<InlineOp<'_>>, builder: &mut TreeBuilder<'_, TextB
                 baseline_aligned,
             }),
             // Nothing for Parley: the box has no text. `line_content_after_last_break` has read it.
-            InlineOp::LineContent => {}
+            InlineOp::BoxStart { .. } | InlineOp::EndEdge => {}
             InlineOp::ForcedBreak => {
                 // The empty span commits the text before the break on its own, so the break is a run of its own.
                 builder.push_style_modification_span(&[]);
@@ -328,44 +349,140 @@ mod tests {
                 InlineOp::Marker(text) => format!("M({text})"),
                 InlineOp::InlineBox { .. } => "<box>".to_string(),
                 InlineOp::ForcedBreak => "<br>".to_string(),
-                InlineOp::LineContent => "<content>".to_string(),
+                InlineOp::BoxStart { edge: true } => "<start+edge>".to_string(),
+                InlineOp::BoxStart { edge: false } => "<start>".to_string(),
+                InlineOp::EndEdge => "<end-edge>".to_string(),
             })
             .collect()
+    }
+
+    fn start(edge: bool) -> InlineOp<'static> {
+        InlineOp::BoxStart { edge }
+    }
+
+    fn content(ops: Vec<InlineOp<'static>>) -> bool {
+        line_content_after_last_break(&collapse_white_space(ops))
     }
 
     #[test]
     fn line_content_is_transparent_for_white_space_and_found_after_the_last_break() {
         // a<br><span style=padding> </span>: the space is collapsed away at the line start, the box stays.
-        let ops = vec![
-            t("a"),
-            InlineOp::ForcedBreak,
-            InlineOp::LineContent,
-            open(),
-            t(" "),
-            close(),
-        ];
-        let collapsed = collapse_white_space(ops);
-        assert!(line_content_after_last_break(&collapsed));
+        let ops = || {
+            vec![
+                t("a"),
+                InlineOp::ForcedBreak,
+                start(true),
+                open(),
+                t(" "),
+                close(),
+            ]
+        };
+        assert!(content(ops()));
+        assert_eq!(show(ops()), "a<br><start+edge>[]");
         // The box before the break is on the line that the break ends.
-        let before = collapse_white_space(vec![
-            InlineOp::LineContent,
+        assert!(!content(vec![
+            start(true),
             open(),
             t("a"),
             InlineOp::ForcedBreak,
-            close(),
-        ]);
-        assert!(!line_content_after_last_break(&before));
+            close()
+        ]));
         // A preserved newline at the end of a text ends the line like a `<br>`.
         let pre = vec![
-            InlineOp::LineContent,
+            start(true),
             InlineOp::Text {
                 text: "a\n".into(),
                 collapse: W::Preserve,
                 case: None,
             },
         ];
-        assert!(!line_content_after_last_break(&collapse_white_space(pre)));
-        assert!(!line_content_after_last_break(&[]));
+        assert!(!content(pre));
+        assert!(!content(vec![]));
+        // A box without an edge is no content.
+        assert!(!content(vec![
+            t("a"),
+            InlineOp::ForcedBreak,
+            start(false),
+            open(),
+            close()
+        ]));
+    }
+
+    #[test]
+    fn an_end_edge_is_content_only_when_a_box_started_after_the_break() {
+        let br = || InlineOp::ForcedBreak;
+        // <span end-edge>a<br><span></span></span>
+        assert!(content(vec![
+            start(false),
+            open(),
+            t("a"),
+            br(),
+            start(false),
+            open(),
+            close(),
+            InlineOp::EndEdge,
+            close(),
+        ]));
+        // <span end-edge>a<br></span>: the close tag belongs to the line the break ends.
+        assert!(!content(vec![
+            start(false),
+            open(),
+            t("a"),
+            br(),
+            InlineOp::EndEdge,
+            close()
+        ]));
+        // <span end-edge>a<br></span><span></span>: the end edge came first.
+        assert!(!content(vec![
+            start(false),
+            open(),
+            t("a"),
+            br(),
+            InlineOp::EndEdge,
+            close(),
+            start(false),
+            open(),
+            close(),
+        ]));
+        // <span><span end-edge>a<br></span><span></span></span>: nothing with an edge after the box started.
+        assert!(!content(vec![
+            start(false),
+            open(),
+            start(false),
+            open(),
+            t("a"),
+            br(),
+            InlineOp::EndEdge,
+            close(),
+            start(false),
+            open(),
+            close(),
+            close(),
+        ]));
+        // <span end-edge>a<br><span end-edge></span></span>: its own end edge, after its own start.
+        assert!(content(vec![
+            start(false),
+            open(),
+            t("a"),
+            br(),
+            start(false),
+            open(),
+            InlineOp::EndEdge,
+            close(),
+            close(),
+        ]));
+        // An end edge before the break is on the line the break ends, however many boxes follow.
+        assert!(!content(vec![
+            start(false),
+            open(),
+            start(false),
+            open(),
+            t("a"),
+            InlineOp::EndEdge,
+            close(),
+            br(),
+            close(),
+        ]));
     }
 
     #[test]
