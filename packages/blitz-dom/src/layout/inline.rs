@@ -19,15 +19,33 @@ use crate::BaseDocument;
 /// with [`parley::BreakLines::revert`]; a real trailing empty line (after a preserved newline) follows a
 /// line holding the newline, which does not overflow.
 ///
+/// The same empty line after a forced break at the end of the text is taken back too: a `<br>` or a preserved newline
+/// ends its line and creates no line of its own when nothing follows it in the block (CSS 2.1 §9.4.2: a line box with no
+/// text, no preserved white space and no other in-flow content is treated as zero-height; html-to-pdf F66f, F37d). The
+/// text then ends in a newline cluster, the breaker is done and the line has no advance. Anything on that line keeps it:
+/// preserved spaces (`pre`, `pre-wrap`) and a no-break space have an advance, an inline box (even one without width) sits
+/// at the end of the text. A block of only `<br>` keeps the line that holds the newline.
+///
 /// With `nowrap` (`text-wrap-mode: nowrap`) the lines are broken at an unbounded width, as Parley's own
 /// `break_all_lines(None)` does: only forced breaks (`<br>`, a preserved newline) end a line, and a line wider
 /// than `width` overflows it (CSS Text 3 §3, §7.1). The line is still aligned against the box, see the caller.
-fn break_lines(layout: &mut parley::Layout<crate::node::TextBrush>, width: f32, nowrap: bool) {
+fn break_lines(
+    layout: &mut parley::Layout<crate::node::TextBrush>,
+    text: &str,
+    width: f32,
+    nowrap: bool,
+) {
+    // Parley's `Whitespace::Newline`: `\n` and `\r` (a `\r\n` pair is one cluster).
+    let ends_in_newline = text.ends_with(['\n', '\r']);
+    let box_after_text = layout.inline_boxes().iter().any(|b| b.index >= text.len());
     let width = if nowrap { f32::MAX } else { width };
     let mut breaker = layout.break_lines();
     let mut previous_overflowed = false;
     while let Some((advance, _)) = breaker.break_next(width) {
-        if breaker.is_done() && advance == 0.0 && previous_overflowed {
+        if breaker.is_done()
+            && advance == 0.0
+            && (previous_overflowed || (ends_in_newline && !box_after_text))
+        {
             breaker.revert();
             break;
         }
@@ -156,7 +174,7 @@ impl BaseDocument {
                     //
                     // FIXME: avoid the need to clone the layout each time
                     let mut layout = inline_layout.clone();
-                    break_lines(&mut layout.layout, width, layout.nowrap);
+                    break_lines(&mut layout.layout, &layout.text, width, layout.nowrap);
 
                     return taffy::Size {
                         width: width.ceil() / scale,
@@ -165,7 +183,12 @@ impl BaseDocument {
                 }
 
                 // Perform inline layout
-                break_lines(&mut inline_layout.layout, width, inline_layout.nowrap);
+                break_lines(
+                    &mut inline_layout.layout,
+                    &inline_layout.text,
+                    width,
+                    inline_layout.nowrap,
+                );
 
                 let alignment = self.nodes[node_id]
                     .primary_styles()
@@ -302,5 +325,151 @@ impl BaseDocument {
             .inline_layout_data = Some(inline_layout);
 
         output
+    }
+}
+
+/// The lines of an inline formatting context after layout: a forced break at the end of a block ends its line and
+/// creates no line of its own (CSS 2.1 §9.4.2, CSS Text 3 §4.1.3), where Parley commits an empty one.
+#[cfg(test)]
+mod trailing_forced_break_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use parley::fontique::{Blob, Collection, CollectionOptions, SourceCache};
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, FontContext, QualName, ns};
+
+    enum N {
+        E(&'static str, &'static str, Vec<N>),
+        T(&'static str),
+    }
+    use N::{E, T};
+
+    fn build(m: &mut crate::DocumentMutator<'_>, n: &N, ids: &mut HashMap<String, usize>) -> usize {
+        match n {
+            T(text) => m.create_text_node(text),
+            E(tag, style, kids) => {
+                let mut attrs = Vec::new();
+                if !style.is_empty() {
+                    attrs.push(Attribute {
+                        name: QualName::new(None, ns!(), "style".into()),
+                        value: style.to_string(),
+                    });
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert((*tag).to_string(), id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// Lines and height (px) of `<div style="font: 20px/20px Bullet; white-space: {white_space}">{kids}</div>`.
+    /// The bundled bullet face is the only font: its glyphs do not matter, the clusters (and the newline among them) do.
+    fn lines(white_space: &str, kids: Vec<N>) -> (usize, f32) {
+        let style: &'static str = Box::leak(
+            format!("font-family:Bullet;font-size:20px;line-height:20px;width:400px;white-space:{white_space}")
+                .into_boxed_str(),
+        );
+        let mut ctx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                system_fonts: false,
+                ..Default::default()
+            }),
+            source_cache: SourceCache::new(Default::default()),
+        };
+        ctx.collection
+            .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+        let mut doc = BaseDocument::new(DocumentConfig {
+            font_ctx: Some(ctx),
+            ..DocumentConfig::default()
+        });
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E(
+                    "html",
+                    "",
+                    vec![E("body", "margin:0", vec![E("div", style, kids)])],
+                ),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        let div = &doc.nodes[ids["div"]];
+        let n = div
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .expect("the div is an inline root")
+            .layout
+            .lines()
+            .count();
+        (n, div.final_layout.size.height)
+    }
+
+    fn br() -> N {
+        E("br", "", vec![])
+    }
+
+    fn check(white_space: &str, kids: Vec<N>, expect: usize) {
+        let (n, h) = lines(white_space, kids);
+        assert_eq!(n, expect, "lines");
+        assert_eq!(h, 20.0 * expect as f32, "height");
+    }
+
+    #[test]
+    fn a_br_at_the_end_makes_no_line() {
+        check("normal", vec![T("a"), br(), T("b"), br()], 2);
+        check("normal", vec![T("a"), br()], 1);
+    }
+
+    #[test]
+    fn two_brs_at_the_end_keep_two_lines() {
+        check("normal", vec![T("a"), br(), br()], 2);
+        check("normal", vec![T("a"), br(), T("b"), br(), br(), br()], 4);
+    }
+
+    #[test]
+    fn a_block_of_only_brs_has_a_line_per_br() {
+        check("normal", vec![br()], 1);
+        check("normal", vec![br(), br(), br()], 3);
+    }
+
+    #[test]
+    fn a_trailing_newline_under_pre_makes_no_line() {
+        check("pre", vec![T("a\nb\n")], 2);
+        check("pre", vec![T("a\n\n")], 2);
+        check("pre", vec![T("\n")], 1);
+        check("pre-wrap", vec![T("a   \n")], 1);
+        check("pre-line", vec![T("\n    Firma\n    Ulice 1\n")], 3);
+    }
+
+    #[test]
+    fn an_empty_line_in_the_middle_stays() {
+        check("pre", vec![T("a\n\nb")], 3);
+        check("pre-line", vec![T("\nx")], 2);
+    }
+
+    #[test]
+    fn anything_on_the_last_line_keeps_it() {
+        // Preserved spaces, a no-break space.
+        check("pre", vec![T("a\n  ")], 2);
+        check("pre-wrap", vec![T("a\n   ")], 2);
+        check("normal", vec![T("a"), br(), T("\u{a0}")], 2);
+        // An inline box, even with no width.
+        let ib = || E("span", "display:inline-block;width:0;height:30px", vec![]);
+        let (n, _) = lines("normal", vec![T("a"), br(), ib()]);
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn collapsible_white_space_after_the_break_is_no_line() {
+        check("normal", vec![T("a"), br(), T(" ")], 1);
+        check("pre-line", vec![T("a\n   ")], 1);
+        check("normal", vec![E("b", "", vec![T("x"), br()])], 1);
     }
 }
