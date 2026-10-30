@@ -773,19 +773,9 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     fn flush_inline_pseudos_recursive(doc: &mut BaseDocument, node_id: usize) {
         doc.iter_children_mut(node_id, |child_id, doc| {
             flush_pseudo_elements(doc, child_id);
-            let display = doc.nodes[node_id]
-                .display_style()
-                .unwrap_or(Display::inline());
-            let child_is_contents = doc.nodes[child_id]
-                .display_style()
-                .is_some_and(|d| d.inside() == DisplayInside::Contents);
-            let do_recurse = child_is_contents
-                || match (display.outside(), display.inside()) {
-                    (DisplayOutside::None, DisplayInside::Contents) => true,
-                    (DisplayOutside::Inline, DisplayInside::Flow) => true,
-                    (_, _) => false,
-                };
-            if do_recurse {
+            // The pseudo-elements of an element are created where the walks below descend into it, whatever
+            // `node_id` is: a nested inline element is reached through its parent, however deep (html-to-pdf F66i).
+            if inline_walk_descends(&doc.nodes[child_id]) {
                 flush_inline_pseudos_recursive(doc, child_id);
             }
         });
@@ -838,12 +828,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
                     (DisplayOutside::Inline, DisplayInside::Flow) => {
                         let tag_name = &element_data.name.local;
 
-                        if *tag_name == local_name!("img")
-                            || *tag_name == local_name!("svg")
-                            || *tag_name == local_name!("input")
-                            || *tag_name == local_name!("textarea")
-                            || *tag_name == local_name!("button")
-                        {
+                        if is_atomic_inline_tag(tag_name) {
                             layout_children.push(node_id);
                         } else if *tag_name == local_name!("br") {
                             node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
@@ -1189,12 +1174,7 @@ pub(crate) fn build_inline_layout_into(
                     (DisplayOutside::Inline, DisplayInside::Flow) => {
                         let tag_name = &element_data.name.local;
 
-                        if *tag_name == local_name!("img")
-                            || *tag_name == local_name!("svg")
-                            || *tag_name == local_name!("input")
-                            || *tag_name == local_name!("textarea")
-                            || *tag_name == local_name!("button")
-                        {
+                        if is_atomic_inline_tag(tag_name) {
                             ops.push(InlineOp::InlineBox {
                                 id: node_id as u64,
                                 baseline_aligned: strut_box(node),
@@ -1314,6 +1294,36 @@ fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
         current = node.parent;
     }
     false
+}
+
+/// The elements the inline walks hand to the layout as one atomic inline box whatever their `display` inside is: replaced
+/// elements and form controls.
+fn is_atomic_inline_tag(tag_name: &markup5ever::LocalName) -> bool {
+    *tag_name == local_name!("img")
+        || *tag_name == local_name!("svg")
+        || *tag_name == local_name!("input")
+        || *tag_name == local_name!("textarea")
+        || *tag_name == local_name!("button")
+}
+
+/// Whether the inline walks (`flush_inline_pseudos_recursive`, `find_inline_layout_embedded_boxes_recursive`,
+/// `build_inline_layout_recursive`) descend into `node`'s pseudo-elements and children: an inline-level `flow` element that is
+/// not laid out as an atomic inline and is not `<br>`, or a `display: contents` element. One predicate for all three, so that
+/// the pseudo-elements that are created and the ones that are read cannot diverge again (html-to-pdf F66i, F159(d)).
+fn inline_walk_descends(node: &Node) -> bool {
+    let (NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data)) = &node.data
+    else {
+        return false;
+    };
+    let display = node.display_style().unwrap_or(Display::inline());
+    match (display.outside(), display.inside()) {
+        (DisplayOutside::None, DisplayInside::Contents) => true,
+        (DisplayOutside::Inline, DisplayInside::Flow) => {
+            let tag_name = &element_data.name.local;
+            !is_atomic_inline_tag(tag_name) && *tag_name != local_name!("br")
+        }
+        (_, _) => false,
+    }
 }
 
 /// `<select>`, `<meter>` and `<progress>`: atomic inlines with a height in Chrome (html-to-pdf F66f round 3). Blitz has no
