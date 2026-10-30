@@ -1056,13 +1056,11 @@ pub(crate) fn build_inline_layout_into(
     AT_WORD_START.with(|w| w.set(true));
     let mut ops = collapse_white_space(ops);
     let mut content_after_last_break = line_content_after_last_break(&ops);
-    // An anonymous block can be one part of a box that Blitz lays out as a block because a block is among its children
-    // (css-inline-3 §3: the box is split around it). What Chrome puts on the line after the break from the other parts
-    // of the box is not in `ops`: `trailing_break_context` reads it from the tree.
-    if !content_after_last_break
-        && root_node.data.kind() == NodeKind::AnonymousBlock
-        && ends_in_forced_break(&ops)
-    {
+    // A block that ends in a forced break can be one part of a box that Blitz lays out as a block because a block is among
+    // its children (css-inline-3 §3: the box is split around it), or have a sibling that has a height in Chrome and none
+    // here. What Chrome puts on the line after the break from them is not in `ops`: `trailing_break_context` reads it
+    // from the tree.
+    if !content_after_last_break && ends_in_forced_break(&ops) {
         let context = trailing_break_context(nodes, root_node);
         if context.end_edge {
             ops.push(InlineOp::EndEdge);
@@ -1335,7 +1333,7 @@ fn ends_in_forced_break(ops: &[InlineOp<'_>]) -> bool {
     })
 }
 
-/// What the line after the trailing forced break of an anonymous block takes from its surroundings.
+/// What the line after the trailing forced break of a block takes from its surroundings.
 #[derive(Default)]
 struct TrailingBreakContext {
     /// The line is kept whatever the block holds: Chrome has a line there that Blitz does not lay out.
@@ -1358,36 +1356,36 @@ struct SiblingSide {
     unlaid_height: bool,
 }
 
-/// Whether `node` is a box that has a height in Chrome and none here: an empty `<details>` (Chrome shows the default
-/// summary), an empty `display: list-item` with an outside marker (a line for the marker). Blitz lays out neither, so the
-/// line after a forced break before or after it stands in for the line.
+/// Whether `node` holds nothing but white space and comments.
+fn is_blank(nodes: &Slab<Node>, node: &Node) -> bool {
+    node.before.is_none()
+        && node.after.is_none()
+        && node.children.iter().all(|&id| match &nodes[id].data {
+            NodeData::Text(text) => text.content.chars().all(|c| c.is_ascii_whitespace()),
+            NodeData::Comment => true,
+            _ => false,
+        })
+}
+
+/// Whether `node` is an empty box that has a height in Chrome and none here: `<details>` (Chrome shows the default
+/// summary), `display: list-item` with an outside marker (a line for the marker). Blitz lays out neither, so the line
+/// after a forced break before or after it stands in for the line. With content of its own the box has a height here too.
 fn unlaid_height(nodes: &Slab<Node>, node: &Node) -> bool {
     let Some(element) = node.element_data() else {
         return false;
     };
-    let blank = |id: &usize| match &nodes[*id].data {
-        NodeData::Text(text) => text.content.chars().all(|c| c.is_ascii_whitespace()),
-        NodeData::Comment => true,
-        _ => false,
-    };
-    if element.name.local == local_name!("details") {
-        return !node.children.iter().any(|&id| {
-            nodes[id]
-                .element_data()
-                .is_some_and(|child| child.name.local == local_name!("summary"))
-        });
+    if !is_blank(nodes, node) {
+        return false;
     }
-    node.display_style().is_some_and(|d| d.is_list_item())
-        && matches!(
-            element.list_item_data.as_deref(),
-            Some(ListItemLayout {
-                position: ListItemLayoutPosition::Outside(_),
-                ..
-            })
-        )
-        && node.before.is_none()
-        && node.after.is_none()
-        && node.children.iter().all(blank)
+    element.name.local == local_name!("details")
+        || (node.display_style().is_some_and(|d| d.is_list_item())
+            && matches!(
+                element.list_item_data.as_deref(),
+                Some(ListItemLayout {
+                    position: ListItemLayoutPosition::Outside(_),
+                    ..
+                })
+            ))
 }
 
 fn scan_siblings(nodes: &Slab<Node>, ids: &[usize], side: &mut SiblingSide) {
@@ -1424,8 +1422,11 @@ fn scan_siblings(nodes: &Slab<Node>, ids: &[usize], side: &mut SiblingSide) {
                 if node.is_or_contains_block() {
                     if styles.clone_float() == Float::None {
                         side.block = true;
-                    } else {
+                    } else if is_blank(nodes, node) {
                         side.float = true;
+                    } else {
+                        // A float with content is a line here: it adds its height to the box that holds it.
+                        side.inline_content = true;
                     }
                     side.unlaid_height |= unlaid_height(nodes, node);
                 } else if *tag == local_name!("br")
@@ -1440,8 +1441,9 @@ fn scan_siblings(nodes: &Slab<Node>, ids: &[usize], side: &mut SiblingSide) {
                 {
                     side.inline_content = true;
                 } else if is_unlaid_form_control(tag) {
+                    // With options (or fallback text) it has text here, which is its line.
                     side.inline_content = true;
-                    side.unlaid_height = true;
+                    side.unlaid_height |= is_blank(nodes, node);
                 } else {
                     scan_siblings(nodes, &node.children, side);
                 }
@@ -1462,8 +1464,8 @@ fn child_holding(nodes: &Slab<Node>, parent: usize, mut node: usize) -> Option<u
     }
 }
 
-/// Reads the surroundings of the anonymous block `anon` for the line after its trailing forced break (html-to-pdf F66f,
-/// round 3). Chrome and Blitz differ in two ways:
+/// Reads the surroundings of the block `root` (an anonymous block, mostly) for the line after its trailing forced break
+/// (html-to-pdf F66f, round 3). Chrome and Blitz differ in two ways:
 ///
 /// - A box with a block in it (`is_or_contains_block`, a float is one) is laid out as a block here, with its text in
 ///   anonymous blocks. Chrome splits the box around the block (css-inline-3 §3): the part before keeps the start
@@ -1474,14 +1476,37 @@ fn child_holding(nodes: &Slab<Node>, parent: usize, mut node: usize) -> Option<u
 ///   (inline outside, flow inside); an edge counts once, at the level where nothing but blocks (or floats, for the
 ///   end) lies between the anonymous block and it. A float takes no line, so it opens none before the text.
 /// - A form control, an empty `<details>` or `display: list-item` has a height in Chrome and none here; with one of
-///   those next to the anonymous block (in the same container) the line is kept.
-fn trailing_break_context(nodes: &Slab<Node>, anon: &Node) -> TrailingBreakContext {
+///   those next to the block (in the same container) the line is kept.
+fn trailing_break_context(nodes: &Slab<Node>, root: &Node) -> TrailingBreakContext {
     let mut context = TrailingBreakContext::default();
-    let (Some(&first), Some(&last)) = (anon.children.first(), anon.children.last()) else {
-        return context;
+    // An anonymous block stands for a run of its parent's children, which may sit inside `display: contents` elements; any
+    // other root is one child of its parent.
+    let (first, last) = if root.data.kind() == NodeKind::AnonymousBlock {
+        let (Some(&first), Some(&last)) = (root.children.first(), root.children.last()) else {
+            return context;
+        };
+        (first, last)
+    } else {
+        // Only a block in flow has siblings in the sense of the text above: not an atomic inline, a float or an
+        // out-of-flow box.
+        let in_flow_block = root
+            .display_style()
+            .is_some_and(|d| d.outside() != DisplayOutside::Inline)
+            && root.primary_styles().is_some_and(|styles| {
+                use style::computed_values::{float::T as Float, position::T as Position};
+                styles.clone_float() == Float::None
+                    && !matches!(
+                        styles.clone_position(),
+                        Position::Absolute | Position::Fixed
+                    )
+            });
+        if !in_flow_block {
+            return context;
+        }
+        (root.id, root.id)
     };
     let (mut first, mut last) = (first, last);
-    let mut parent = anon.parent;
+    let mut parent = root.parent;
     let mut level = 0;
     // A block or a float seen on the way: the edges above are on a line of their own. `start_done` / `end_done`: text or an
     // atomic inline lies between the anonymous block and the edges above, they are on its line.

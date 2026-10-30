@@ -759,6 +759,14 @@ mod trailing_forced_break_tests {
             ),
             ("float", span(pad, vec![T("a"), br(), float()]), 2.0),
             (
+                "float with text: its own line is the one",
+                span(
+                    pad,
+                    vec![T("a"), br(), E("span", "float:left", vec![T("fl")])],
+                ),
+                2.0,
+            ),
+            (
                 "float after a block",
                 span(pad, vec![T("a"), br(), block("blk"), float()]),
                 3.0,
@@ -907,11 +915,39 @@ mod trailing_forced_break_tests {
                 2.0,
             ),
             ("empty block", block(""), 1.0),
+            (
+                "details with text, which is laid out",
+                E("details", "", vec![T("t")]),
+                2.0,
+            ),
+            (
+                "select with an option, which is laid out",
+                E("select", "", vec![E("option", "", vec![T("x")])]),
+                2.0,
+            ),
         ];
         for (name, after, lines) in cases {
             let after_br = height_in_lines(vec![T("a"), br(), after]);
             assert_eq!(after_br, lines, "{name} after a<br>");
         }
+        // A block that is not anonymous, followed by the box: `<p>a<br></p><details></details>`.
+        assert_eq!(
+            height_in_lines(vec![
+                E("p", "margin:0", vec![T("a"), br()]),
+                E("details", "", vec![])
+            ]),
+            2.0,
+            "<p>a<br></p><details></details>"
+        );
+        // An atomic inline is not a block in flow: the select is on its line.
+        assert_eq!(
+            height_in_lines(vec![
+                E("span", "display:inline-block", vec![T("a"), br()]),
+                E("select", "", vec![])
+            ]),
+            1.0,
+            "<span inline-block>a<br></span><select>"
+        );
         // Also when it is a few siblings later, and before the text.
         assert_eq!(
             height_in_lines(vec![T("a"), br(), block("blk"), E("details", "", vec![])]),
