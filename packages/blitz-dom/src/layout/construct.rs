@@ -1054,8 +1054,22 @@ pub(crate) fn build_inline_layout_into(
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
     // `text-transform: capitalize` looks at word boundaries across the whole inline formatting context.
     AT_WORD_START.with(|w| w.set(true));
-    let ops = collapse_white_space(ops);
-    text_layout.content_after_last_break = line_content_after_last_break(&ops);
+    let mut ops = collapse_white_space(ops);
+    let mut content_after_last_break = line_content_after_last_break(&ops);
+    // An anonymous block can be one part of a box that Blitz lays out as a block because a block is among its children
+    // (css-inline-3 §3: the box is split around it). What Chrome puts on the line after the break from the other parts
+    // of the box is not in `ops`: `trailing_break_context` reads it from the tree.
+    if !content_after_last_break
+        && root_node.data.kind() == NodeKind::AnonymousBlock
+        && ends_in_forced_break(&ops)
+    {
+        let context = trailing_break_context(nodes, root_node);
+        if context.end_edge {
+            ops.push(InlineOp::EndEdge);
+        }
+        content_after_last_break = context.keep_line || line_content_after_last_break(&ops);
+    }
+    text_layout.content_after_last_break = content_after_last_break;
     replay(ops, &mut builder);
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
@@ -1196,8 +1210,12 @@ pub(crate) fn build_inline_layout_into(
                             let style = inline_span_style(node, root_line_height);
 
                             let (start_edge, end_edge) = inline_axis_edges(node);
+                            // `<wbr>` and the form controls Chrome lays out as atomic inlines (Blitz has no box for
+                            // them) are content of the line they are on.
                             ops.push(InlineOp::BoxStart {
-                                edge: start_edge || *tag_name == local_name!("wbr"),
+                                edge: start_edge
+                                    || *tag_name == local_name!("wbr")
+                                    || is_unlaid_form_control(tag_name),
                             });
                             ops.push(InlineOp::PushSpan(style));
 
@@ -1298,6 +1316,242 @@ fn inside_atomic_inline(nodes: &Slab<Node>, root_id: usize) -> bool {
         current = node.parent;
     }
     false
+}
+
+/// `<select>`, `<meter>` and `<progress>`: atomic inlines with a height in Chrome (html-to-pdf F66f round 3). Blitz has no
+/// display rule for them, so they are empty inline elements, which leaves the line after a forced break empty.
+fn is_unlaid_form_control(tag_name: &markup5ever::LocalName) -> bool {
+    *tag_name == local_name!("select")
+        || *tag_name == local_name!("meter")
+        || *tag_name == local_name!("progress")
+}
+
+/// Whether the context ends in a forced break: a `<br>` or a preserved newline, with nothing but style ops after it.
+fn ends_in_forced_break(ops: &[InlineOp<'_>]) -> bool {
+    ops.iter().any(|op| match op {
+        InlineOp::ForcedBreak => true,
+        InlineOp::Text { text, .. } => text.ends_with(['\n', '\r']),
+        _ => false,
+    })
+}
+
+/// What the line after the trailing forced break of an anonymous block takes from its surroundings.
+#[derive(Default)]
+struct TrailingBreakContext {
+    /// The line is kept whatever the block holds: Chrome has a line there that Blitz does not lay out.
+    keep_line: bool,
+    /// The end edge of an open box lands on the last line of the block (the box ends with it), so it counts as content
+    /// when a box has started after the break (`EndEdge`).
+    end_edge: bool,
+}
+
+/// What the siblings on one side of a node hold, as far as the line after a forced break is concerned.
+#[derive(Default)]
+struct SiblingSide {
+    /// Text, a `<br>` or an atomic inline: a line of its own, which carries the edges of the boxes that end around it.
+    inline_content: bool,
+    /// A block-level box in flow, a float excluded.
+    block: bool,
+    /// A float: it takes no line of its own, but it is not text either.
+    float: bool,
+    /// A box that has a height in Chrome and none here, see [`unlaid_height`].
+    unlaid_height: bool,
+}
+
+/// Whether `node` is a box that has a height in Chrome and none here: an empty `<details>` (Chrome shows the default
+/// summary), an empty `display: list-item` with an outside marker (a line for the marker). Blitz lays out neither, so the
+/// line after a forced break before or after it stands in for the line.
+fn unlaid_height(nodes: &Slab<Node>, node: &Node) -> bool {
+    let Some(element) = node.element_data() else {
+        return false;
+    };
+    let blank = |id: &usize| match &nodes[*id].data {
+        NodeData::Text(text) => text.content.chars().all(|c| c.is_ascii_whitespace()),
+        NodeData::Comment => true,
+        _ => false,
+    };
+    if element.name.local == local_name!("details") {
+        return !node.children.iter().any(|&id| {
+            nodes[id]
+                .element_data()
+                .is_some_and(|child| child.name.local == local_name!("summary"))
+        });
+    }
+    node.display_style().is_some_and(|d| d.is_list_item())
+        && matches!(
+            element.list_item_data.as_deref(),
+            Some(ListItemLayout {
+                position: ListItemLayoutPosition::Outside(_),
+                ..
+            })
+        )
+        && node.before.is_none()
+        && node.after.is_none()
+        && node.children.iter().all(blank)
+}
+
+fn scan_siblings(nodes: &Slab<Node>, ids: &[usize], side: &mut SiblingSide) {
+    use style::computed_values::{float::T as Float, position::T as Position};
+
+    for &id in ids {
+        let node = &nodes[id];
+        match &node.data {
+            NodeData::Text(text) => {
+                // A no-break space is not white space here (it is not ASCII), a collapsible space is nothing.
+                side.inline_content |= text.content.chars().any(|c| !c.is_ascii_whitespace());
+            }
+            NodeData::Element(element) | NodeData::AnonymousBlock(element) => {
+                let (Some(display), Some(styles)) = (node.display_style(), node.primary_styles())
+                else {
+                    continue;
+                };
+                if display.outside() == DisplayOutside::None
+                    && display.inside() != DisplayInside::Contents
+                {
+                    continue;
+                }
+                if display.inside() == DisplayInside::Contents {
+                    scan_siblings(nodes, &node.children, side);
+                    continue;
+                }
+                if matches!(
+                    styles.clone_position(),
+                    Position::Absolute | Position::Fixed
+                ) {
+                    continue;
+                }
+                let tag = &element.name.local;
+                if node.is_or_contains_block() {
+                    if styles.clone_float() == Float::None {
+                        side.block = true;
+                    } else {
+                        side.float = true;
+                    }
+                    side.unlaid_height |= unlaid_height(nodes, node);
+                } else if *tag == local_name!("br")
+                    || *tag == local_name!("img")
+                    || *tag == local_name!("svg")
+                    || *tag == local_name!("input")
+                    || *tag == local_name!("textarea")
+                    || *tag == local_name!("button")
+                    || display.inside() != DisplayInside::Flow
+                    || node.before.is_some()
+                    || node.after.is_some()
+                {
+                    side.inline_content = true;
+                } else if is_unlaid_form_control(tag) {
+                    side.inline_content = true;
+                    side.unlaid_height = true;
+                } else {
+                    scan_siblings(nodes, &node.children, side);
+                }
+            }
+            NodeData::Comment | NodeData::Document => {}
+        }
+    }
+}
+
+/// The position of the child of `parent` that holds `node` (or is it), if `node` is in its subtree.
+fn child_holding(nodes: &Slab<Node>, parent: usize, mut node: usize) -> Option<usize> {
+    loop {
+        let up = nodes[node].parent?;
+        if up == parent {
+            return nodes[parent].children.iter().position(|&id| id == node);
+        }
+        node = up;
+    }
+}
+
+/// Reads the surroundings of the anonymous block `anon` for the line after its trailing forced break (html-to-pdf F66f,
+/// round 3). Chrome and Blitz differ in two ways:
+///
+/// - A box with a block in it (`is_or_contains_block`, a float is one) is laid out as a block here, with its text in
+///   anonymous blocks. Chrome splits the box around the block (css-inline-3 §3): the part before keeps the start
+///   edge, the part after the end edge, and a part with nothing but an edge is a line (`<span style="padding-right:4px">
+///   a<br><div>blk</div></span>` is a, blk and an empty line). The line is not there in Blitz, so the line after the
+///   break stands in for it: `keep_line`. When the break is in the last part, the end edge lands on its last line
+///   like it does inline (`end_edge`). Both walk up through the boxes that are laid out as blocks only for that reason
+///   (inline outside, flow inside); an edge counts once, at the level where nothing but blocks (or floats, for the
+///   end) lies between the anonymous block and it. A float takes no line, so it opens none before the text.
+/// - A form control, an empty `<details>` or `display: list-item` has a height in Chrome and none here; with one of
+///   those next to the anonymous block (in the same container) the line is kept.
+fn trailing_break_context(nodes: &Slab<Node>, anon: &Node) -> TrailingBreakContext {
+    let mut context = TrailingBreakContext::default();
+    let (Some(&first), Some(&last)) = (anon.children.first(), anon.children.last()) else {
+        return context;
+    };
+    let (mut first, mut last) = (first, last);
+    let mut parent = anon.parent;
+    let mut level = 0;
+    // A block or a float seen on the way: the edges above are on a line of their own. `start_done` / `end_done`: text or an
+    // atomic inline lies between the anonymous block and the edges above, they are on its line.
+    let (mut block_before, mut block_after) = (false, false);
+    let (mut start_done, mut end_done) = (false, false);
+    while let Some(parent_id) = parent {
+        let container = &nodes[parent_id];
+        let (Some(first_at), Some(last_at)) = (
+            child_holding(nodes, parent_id, first),
+            child_holding(nodes, parent_id, last),
+        ) else {
+            break;
+        };
+        let (mut before, mut after) = (SiblingSide::default(), SiblingSide::default());
+        scan_siblings(nodes, &container.children[..first_at], &mut before);
+        scan_siblings(nodes, &container.children[last_at + 1..], &mut after);
+        before.inline_content |= container.before.is_some();
+        after.inline_content |= container.after.is_some();
+
+        let display = container.display_style();
+        let block_container = display.is_none_or(|d| {
+            matches!(
+                d.inside(),
+                DisplayInside::Flow | DisplayInside::FlowRoot | DisplayInside::TableCell
+            )
+        });
+        if level == 0 && block_container && (before.unlaid_height || after.unlaid_height) {
+            context.keep_line = true;
+        }
+
+        let blockified_inline = matches!(container.data, NodeData::Element(_))
+            && display.is_some_and(|d| {
+                d.outside() == DisplayOutside::Inline && d.inside() == DisplayInside::Flow
+            });
+        if !blockified_inline {
+            break;
+        }
+        let (start, end) = inline_axis_edges(container);
+        if !start_done {
+            if before.inline_content {
+                start_done = true;
+            } else {
+                block_before |= before.block;
+                if start && block_before {
+                    context.keep_line = true;
+                }
+            }
+        }
+        if !end_done {
+            if after.inline_content {
+                end_done = true;
+            } else {
+                block_after |= after.block || after.float;
+                if end {
+                    if block_after {
+                        context.keep_line = true;
+                    } else {
+                        context.end_edge = true;
+                    }
+                }
+            }
+        }
+        if start_done && end_done {
+            break;
+        }
+        (first, last) = (parent_id, parent_id);
+        parent = container.parent;
+        level += 1;
+    }
+    context
 }
 
 /// Whether an inline element has a non-zero margin, padding or border on its inline-start side and on its inline-end side
