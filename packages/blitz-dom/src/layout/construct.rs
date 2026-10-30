@@ -2778,3 +2778,258 @@ mod strut_tests {
         assert_eq!(height(&doc, div), 0.0);
     }
 }
+
+/// The `::before` / `::after` of an inline element nested in another inline element are boxes of the line layout like
+/// any other (CSS 2.1 section 12.1): the pseudo-element of a host two or more levels below the root of the line layout is
+/// created, and its text and boxes are in the root's layout (html-to-pdf F66i).
+#[cfg(test)]
+mod nested_inline_pseudo_tests {
+    use std::collections::HashMap;
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, QualName, ns};
+
+    enum N {
+        E(&'static str, &'static str, &'static str, Vec<N>),
+        T(&'static str),
+    }
+    use N::{E, T};
+
+    fn build(
+        m: &mut crate::DocumentMutator<'_>,
+        n: &N,
+        ids: &mut HashMap<&'static str, usize>,
+    ) -> usize {
+        match n {
+            T(text) => m.create_text_node(text),
+            E(tag, name, style, kids) => {
+                let attr = |n: &str, v: &str| Attribute {
+                    name: QualName::new(None, ns!(), n.into()),
+                    value: v.to_string(),
+                };
+                let mut attrs = vec![attr("id", name)];
+                if !style.is_empty() {
+                    attrs.push(attr("style", style));
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert(name, id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// Resolves `<html><body>{body}</body></html>` with the user-agent rules `css`.
+    fn resolved(css: &str, body: Vec<N>) -> (BaseDocument, HashMap<&'static str, usize>) {
+        let mut doc = BaseDocument::new(DocumentConfig::default());
+        doc.add_user_agent_stylesheet(css);
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E("html", "html", "", vec![E("body", "body", "", body)]),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    fn text_of(doc: &BaseDocument, root: usize) -> String {
+        doc.nodes[root]
+            .element_data()
+            .and_then(|el| el.inline_layout_data.as_ref())
+            .map(|layout| layout.text.clone())
+            .unwrap_or_else(|| panic!("node {root} has no inline layout"))
+    }
+
+    /// The nodes `a <span id=h>{host_text}</span> w`, wrapped in `depth - 1` spans (a depth of 1 is the three nodes).
+    fn run(depth: usize, host_text: &'static str) -> Vec<N> {
+        let host = E(
+            "span",
+            "h",
+            "",
+            if host_text.is_empty() {
+                vec![]
+            } else {
+                vec![T(host_text)]
+            },
+        );
+        let mut nodes = vec![T("a "), host, T(" w")];
+        for _ in 1..depth {
+            nodes = vec![E("span", "w", "", nodes)];
+        }
+        nodes
+    }
+
+    const BEFORE: &str = "#h::before { content: \"tx\" }";
+    const AFTER: &str = "#h::after { content: \"ty\" }";
+
+    #[test]
+    fn the_pseudo_of_a_nested_host_is_in_the_layout_of_a_block_root() {
+        for depth in 1..=4 {
+            for (css, wanted) in [(BEFORE, "tx"), (AFTER, "ty")] {
+                for host_text in ["", "h"] {
+                    let (doc, ids) = resolved(css, vec![E("div", "r", "", run(depth, host_text))]);
+                    let text = text_of(&doc, ids["r"]);
+                    assert!(
+                        text.contains(wanted),
+                        "depth {depth}, {css}, host text {host_text:?}: layout text {text:?}"
+                    );
+                    let host = &doc.nodes[ids["h"]];
+                    assert!(
+                        host.before.is_some() || host.after.is_some(),
+                        "depth {depth}, {css}: the host has a pseudo-element"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pseudo_of_a_nested_host_is_in_the_layout_of_any_root_kind() {
+        for depth in 2..=3 {
+            let roots: [(&str, N); 4] = [
+                ("p", E("p", "r", "", run(depth, ""))),
+                (
+                    "table cell",
+                    E(
+                        "table",
+                        "tbl",
+                        "",
+                        vec![E("tr", "tr", "", vec![E("td", "r", "", run(depth, ""))])],
+                    ),
+                ),
+                (
+                    "inline-block",
+                    E(
+                        "div",
+                        "o",
+                        "",
+                        vec![E("span", "r", "display:inline-block", run(depth, ""))],
+                    ),
+                ),
+                (
+                    "flex item",
+                    E(
+                        "div",
+                        "o",
+                        "display:flex",
+                        vec![E("div", "r", "", run(depth, ""))],
+                    ),
+                ),
+            ];
+            for (name, root) in roots {
+                let (doc, ids) = resolved(BEFORE, vec![root]);
+                let text = text_of(&doc, ids["r"]);
+                assert!(
+                    text.contains("tx"),
+                    "{name} root, depth {depth}: layout text {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_nested_inline_block_pseudo_is_a_layout_child_of_the_root() {
+        for depth in 1..=3 {
+            let (doc, ids) = resolved(
+                "#h::before { content: \"\"; display: inline-block; width: 6px; height: 6px }",
+                vec![E("div", "r", "", run(depth, ""))],
+            );
+            let before = doc.nodes[ids["h"]].before.expect("the host has ::before");
+            let children = doc.nodes[ids["r"]]
+                .layout_children
+                .borrow()
+                .clone()
+                .unwrap_or_default();
+            assert!(
+                children.contains(&before),
+                "depth {depth}: the pseudo-element {before} is among the layout children {children:?} of the root"
+            );
+        }
+    }
+
+    #[test]
+    fn an_anonymous_block_root_and_a_contents_chain_still_print_the_pseudo() {
+        // The inline run sits next to a block: its root is an anonymous block.
+        let (doc, ids) = resolved(
+            BEFORE,
+            vec![E(
+                "div",
+                "r",
+                "",
+                vec![
+                    E("span", "w", "", run(1, "")),
+                    E("div", "blk", "", vec![T("blk")]),
+                ],
+            )],
+        );
+        let anon_root = doc.nodes[ids["w"]]
+            .layout_parent
+            .get()
+            .expect("layout parent");
+        assert!(
+            text_of(&doc, anon_root).contains("tx"),
+            "anonymous block root: {:?}",
+            text_of(&doc, anon_root)
+        );
+        // `display: contents` between the root and the host.
+        let (doc, ids) = resolved(
+            BEFORE,
+            vec![E(
+                "div",
+                "r",
+                "",
+                vec![E(
+                    "span",
+                    "c1",
+                    "display:contents",
+                    vec![E("span", "c2", "display:contents", run(1, ""))],
+                )],
+            )],
+        );
+        assert!(text_of(&doc, ids["r"]).contains("tx"));
+    }
+
+    #[test]
+    fn a_pseudo_under_display_none_inside_an_anonymous_block_is_not_read() {
+        let (doc, ids) = resolved(
+            BEFORE,
+            vec![E(
+                "div",
+                "r",
+                "",
+                vec![
+                    E(
+                        "span",
+                        "w",
+                        "",
+                        vec![
+                            T("a "),
+                            E(
+                                "span",
+                                "n",
+                                "display:none",
+                                vec![E("span", "h", "", vec![])],
+                            ),
+                            T(" w"),
+                        ],
+                    ),
+                    E("div", "blk", "", vec![T("blk")]),
+                ],
+            )],
+        );
+        let anon_root = doc.nodes[ids["w"]]
+            .layout_parent
+            .get()
+            .expect("layout parent");
+        assert!(
+            !text_of(&doc, anon_root).contains("tx"),
+            "{:?}",
+            text_of(&doc, anon_root)
+        );
+    }
+}
