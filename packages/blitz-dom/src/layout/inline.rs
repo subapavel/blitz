@@ -374,9 +374,10 @@ mod trailing_forced_break_tests {
         }
     }
 
-    /// Lines and height (px) of `<div style="font: 20px/20px Bullet; white-space: {white_space}">{kids}</div>`.
-    /// The bundled bullet face is the only font: its glyphs do not matter, the clusters (and the newline among them) do.
-    fn lines(white_space: &str, kids: Vec<N>) -> (usize, f32) {
+    /// The document of `<div style="font: 20px/20px Bullet; white-space: {white_space}">{kids}</div>` laid out, with the
+    /// node ids by tag name (the last element of a tag wins). The bundled bullet face is the only font: its glyphs do not
+    /// matter, the clusters (and the newline among them) do.
+    fn laid_out(white_space: &str, kids: Vec<N>) -> (BaseDocument, HashMap<String, usize>) {
         let style: &'static str = Box::leak(
             format!("font-family:Bullet;font-size:20px;line-height:20px;width:400px;white-space:{white_space}")
                 .into_boxed_str(),
@@ -409,6 +410,12 @@ mod trailing_forced_break_tests {
             m.append_children(0, &[html]);
         }
         doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    /// Lines and height (px) of `<div style="font: 20px/20px Bullet; white-space: {white_space}">{kids}</div>`.
+    fn lines(white_space: &str, kids: Vec<N>) -> (usize, f32) {
+        let (doc, ids) = laid_out(white_space, kids);
         let div = &doc.nodes[ids["div"]];
         let n = div
             .element_data()
@@ -418,6 +425,13 @@ mod trailing_forced_break_tests {
             .lines()
             .count();
         (n, div.final_layout.size.height)
+    }
+
+    /// Height (px) of the outer `<div>` when its content has blocks in it (it is no inline root then), in lines of 20 px.
+    fn height_in_lines(kids: Vec<N>) -> f32 {
+        let (doc, ids) = laid_out("normal", kids);
+        let outer = doc.nodes[ids["body"]].children[0];
+        doc.nodes[outer].final_layout.size.height / 20.0
     }
 
     fn br() -> N {
@@ -679,5 +693,235 @@ mod trailing_forced_break_tests {
         check("normal", vec![T("a"), br(), T(" ")], 1);
         check("pre-line", vec![T("a\n   ")], 1);
         check("normal", vec![E("b", "", vec![T("x"), br()])], 1);
+    }
+
+    fn span(style: &'static str, kids: Vec<N>) -> N {
+        E("span", style, kids)
+    }
+
+    fn block(text: &'static str) -> N {
+        E(
+            "div",
+            "",
+            if text.is_empty() {
+                vec![]
+            } else {
+                vec![T(text)]
+            },
+        )
+    }
+
+    fn float() -> N {
+        E("span", "float:left", vec![])
+    }
+
+    #[test]
+    fn the_end_edge_of_a_box_with_a_block_in_it_makes_a_line_after_the_block() {
+        // Chrome (m141): `<span style="padding-right:4px">a<br><div>blk</div></span>` splits the span around the block;
+        // the part after the block is empty but has the end edge, so it is a line: a, blk, and that line. Blitz lays the
+        // span out as a block, so the line after the block is not there; the line after the break stands in for it.
+        let pad = "padding-right:4px";
+        let cases: Vec<(&str, N, f32)> = vec![
+            ("block", span(pad, vec![T("a"), br(), block("blk")]), 3.0),
+            ("empty block", span(pad, vec![T("a"), br(), block("")]), 2.0),
+            (
+                "two blocks",
+                span(pad, vec![T("a"), br(), block("blk"), block("b2")]),
+                4.0,
+            ),
+            (
+                "white space after the block",
+                span(pad, vec![T("a"), br(), block("blk"), T("  ")]),
+                3.0,
+            ),
+            (
+                "empty box after the block",
+                span(pad, vec![T("a"), br(), block("blk"), span("", vec![])]),
+                3.0,
+            ),
+            (
+                "inner box without an edge",
+                span(pad, vec![span("", vec![T("a"), br(), block("blk")])]),
+                3.0,
+            ),
+            (
+                "both boxes with an edge",
+                span(pad, vec![span(pad, vec![T("a"), br(), block("blk")])]),
+                3.0,
+            ),
+            (
+                "two lines of text, blocks between",
+                span(
+                    pad,
+                    vec![T("a"), br(), block("blk"), T("b"), br(), block("b2")],
+                ),
+                5.0,
+            ),
+            ("float", span(pad, vec![T("a"), br(), float()]), 2.0),
+            (
+                "float after a block",
+                span(pad, vec![T("a"), br(), block("blk"), float()]),
+                3.0,
+            ),
+            (
+                "inner box closed, float after it",
+                span(pad, vec![span("", vec![T("a"), br()]), float()]),
+                2.0,
+            ),
+            (
+                "the edge on the left, rtl",
+                span(
+                    "direction:rtl;padding-left:4px",
+                    vec![T("a"), br(), block("blk")],
+                ),
+                3.0,
+            ),
+        ];
+        for (name, kids, lines) in cases {
+            assert_eq!(height_in_lines(vec![kids]), lines, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_box_with_a_block_in_it_and_the_break_in_its_last_part_follows_the_open_end_edge_rule() {
+        // The part after the last block is an anonymous block of its own: the end edge of the box lands on it, and keeps
+        // the line after the break when a box starts after it (the rule of the inline case above).
+        let pad = "padding-right:4px";
+        let cases: Vec<(&str, N, f32)> = vec![
+            (
+                "empty box after the break",
+                span(pad, vec![block("blk"), T("a"), br(), span("", vec![])]),
+                3.0,
+            ),
+            (
+                "inner box without an edge",
+                span(
+                    pad,
+                    vec![block("blk"), span("", vec![T("a"), br(), span("", vec![])])],
+                ),
+                3.0,
+            ),
+            (
+                "box with an edge, nothing after the break",
+                span(pad, vec![block("blk"), T("a"), br()]),
+                2.0,
+            ),
+            (
+                "the edge on the start side opens a line before the block",
+                span("padding-left:4px", vec![block("blk"), T("a"), br()]),
+                3.0,
+            ),
+            (
+                "the same with a box after the break",
+                span(
+                    "padding-left:4px",
+                    vec![block("blk"), T("a"), br(), span("", vec![])],
+                ),
+                3.0,
+            ),
+            (
+                "a float before it is no line",
+                span("padding-left:4px", vec![float(), T("a"), br()]),
+                1.0,
+            ),
+        ];
+        for (name, kids, lines) in cases {
+            assert_eq!(height_in_lines(vec![kids]), lines, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_box_with_a_block_in_it_and_no_edge_after_the_break_makes_no_line() {
+        // Guards: these were right before the change and stay.
+        let cases: Vec<(&str, N, f32)> = vec![
+            ("no edge", span("", vec![T("a"), br(), block("blk")]), 2.0),
+            (
+                "start edge only, the line of the text",
+                span("padding-left:4px", vec![T("a"), br(), block("blk")]),
+                2.0,
+            ),
+            (
+                "text after the block carries the edge",
+                span(
+                    "padding-right:4px",
+                    vec![T("a"), br(), block("blk"), T("w")],
+                ),
+                3.0,
+            ),
+            (
+                "a block container: nothing to carry",
+                block_with_br_then_block(),
+                2.0,
+            ),
+        ];
+        for (name, kids, lines) in cases {
+            assert_eq!(height_in_lines(vec![kids]), lines, "{name}");
+        }
+    }
+
+    fn block_with_br_then_block() -> N {
+        E("p", "margin:0", vec![T("a"), br(), block("blk")])
+    }
+
+    #[test]
+    fn a_form_control_after_the_break_is_content() {
+        // Chrome: `<select>`, `<meter>` and `<progress>` are atomic inlines with a height, so the line after the break is
+        // not empty. Blitz lays them out as empty inline elements.
+        for tag in ["select", "meter", "progress"] {
+            check("normal", vec![T("a"), br(), E(tag, "", vec![])], 2);
+            check(
+                "normal",
+                vec![
+                    span("padding-right:4px", vec![T("a"), br()]),
+                    E(tag, "", vec![]),
+                ],
+                2,
+            );
+        }
+        // An empty `<span>` is not.
+        check("normal", vec![T("a"), br(), E("span", "", vec![])], 1);
+    }
+
+    #[test]
+    fn a_box_with_a_height_blitz_does_not_lay_out_keeps_the_line_before_it() {
+        // Chrome: an empty `<details>` shows its default summary, an empty `display: list-item` with a marker has a line
+        // for the marker. Neither has a height here, so the line after the break stands in for it. Where Blitz does lay
+        // the content out (a summary, text, no marker) it is not added a second time.
+        let li = |style: &'static str, kids: Vec<N>| E("span", style, kids);
+        let cases: Vec<(&str, N, f32)> = vec![
+            ("empty details", E("details", "", vec![]), 2.0),
+            (
+                "details with a summary",
+                E("details", "", vec![E("summary", "", vec![T("s")])]),
+                2.0,
+            ),
+            ("empty list item", li("display:list-item", vec![]), 2.0),
+            (
+                "list item without a marker",
+                li("display:list-item;list-style:none", vec![]),
+                1.0,
+            ),
+            (
+                "list item with text",
+                li("display:list-item", vec![T("t")]),
+                2.0,
+            ),
+            ("empty block", block(""), 1.0),
+        ];
+        for (name, after, lines) in cases {
+            let after_br = height_in_lines(vec![T("a"), br(), after]);
+            assert_eq!(after_br, lines, "{name} after a<br>");
+        }
+        // Also when it is a few siblings later, and before the text.
+        assert_eq!(
+            height_in_lines(vec![T("a"), br(), block("blk"), E("details", "", vec![])]),
+            3.0,
+            "a<br><div>blk</div><details>"
+        );
+        assert_eq!(
+            height_in_lines(vec![E("details", "", vec![]), T("a"), br()]),
+            2.0,
+            "<details></details>a<br>"
+        );
     }
 }
