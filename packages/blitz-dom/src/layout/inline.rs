@@ -961,3 +961,211 @@ mod trailing_forced_break_tests {
         );
     }
 }
+
+/// An atomic inline (a non-replaced `inline-block`, `inline-flex`, ...) in the text of a flex item keeps its own
+/// `width` / `height` / `min-height`. Taffy's flexbox lays its items out in `SizingMode::ContentSize` ("the caller
+/// already applied this node's own size, so ignore `size`"); the inline formatting context of an item must not hand
+/// that mode on to the boxes in its lines (CSS 2.1 §10.3.9, §10.6.6; html-to-pdf F217).
+#[cfg(test)]
+mod flex_item_inline_box_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use parley::fontique::{Blob, Collection, CollectionOptions, SourceCache};
+
+    use crate::{Attribute, BaseDocument, DocumentConfig, FontContext, QualName, ns};
+
+    enum N {
+        E(&'static str, &'static str, Vec<N>),
+        T(&'static str),
+    }
+    use N::{E, T};
+
+    fn build(m: &mut crate::DocumentMutator<'_>, n: &N, ids: &mut HashMap<String, usize>) -> usize {
+        match n {
+            T(text) => m.create_text_node(text),
+            E(tag, style, kids) => {
+                let mut attrs = Vec::new();
+                if !style.is_empty() {
+                    attrs.push(Attribute {
+                        name: QualName::new(None, ns!(), "style".into()),
+                        value: style.to_string(),
+                    });
+                }
+                let id = m.create_element(QualName::new(None, ns!(html), (*tag).into()), attrs);
+                ids.insert((*tag).to_string(), id);
+                let kids: Vec<usize> = kids.iter().map(|k| build(m, k, ids)).collect();
+                m.append_children(id, &kids);
+                id
+            }
+        }
+    }
+
+    /// `<section style="{section}"><div style="{item}">{kids}</div></section>` in a 800 px wide body, laid out. Node
+    /// ids by tag name (the last element of a tag wins); the only font is the bundled bullet face, 20 px / 20 px.
+    fn laid_out(
+        section: &'static str,
+        item: &'static str,
+        kids: Vec<N>,
+    ) -> (BaseDocument, HashMap<String, usize>) {
+        let mut ctx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                system_fonts: false,
+                ..Default::default()
+            }),
+            source_cache: SourceCache::new(Default::default()),
+        };
+        ctx.collection
+            .register_fonts(Blob::new(Arc::new(crate::BULLET_FONT) as _), None);
+        let mut doc = BaseDocument::new(DocumentConfig {
+            font_ctx: Some(ctx),
+            ..DocumentConfig::default()
+        });
+        let mut ids = HashMap::new();
+        {
+            let mut m = doc.mutate();
+            let html = build(
+                &mut m,
+                &E(
+                    "html",
+                    "",
+                    vec![E(
+                        "body",
+                        "margin:0;font-family:Bullet;font-size:20px;line-height:20px",
+                        vec![E("section", section, vec![E("div", item, kids)])],
+                    )],
+                ),
+                &mut ids,
+            );
+            m.append_children(0, &[html]);
+        }
+        doc.resolve(0.0);
+        (doc, ids)
+    }
+
+    /// (width, height) of the `<span>` and the height of the item `<div>`, in px, for a row flex container.
+    fn measure(section: &'static str, item: &'static str, kids: Vec<N>) -> ((f32, f32), f32) {
+        let (doc, ids) = laid_out(section, item, kids);
+        let span = doc.nodes[ids["span"]].final_layout.size;
+        let div = doc.nodes[ids["div"]].final_layout.size.height;
+        ((span.width, span.height), div)
+    }
+
+    const ROW: &str = "display:flex";
+    const COLUMN: &str = "display:flex;flex-direction:column";
+
+    fn around(span: N) -> Vec<N> {
+        vec![T("pay "), span, T(" now")]
+    }
+
+    #[test]
+    fn an_empty_box_with_a_size_is_that_size() {
+        let b = || {
+            around(E(
+                "span",
+                "display:inline-block;width:112px;height:112px",
+                vec![],
+            ))
+        };
+        for (name, section) in [("row", ROW), ("column", COLUMN)] {
+            let (size, item) = measure(section, "", b());
+            assert_eq!(size, (112.0, 112.0), "box, {name}");
+            assert!(item >= 112.0, "item height {item}, {name}");
+        }
+        // Border and padding are inside the border box of `box-sizing: border-box`, outside of the content box.
+        let (size, item) = measure(
+            ROW,
+            "",
+            around(E(
+                "span",
+                "display:inline-block;width:112px;height:112px;border:1px solid #000;padding:4px",
+                vec![],
+            )),
+        );
+        assert_eq!(size, (122.0, 122.0));
+        assert!(item >= 122.0, "item height {item}");
+    }
+
+    #[test]
+    fn a_box_with_text_keeps_its_height_and_width() {
+        let (size, item) = measure(
+            ROW,
+            "",
+            around(E(
+                "span",
+                "display:inline-block;height:112px",
+                vec![T("QR")],
+            )),
+        );
+        assert_eq!(size.1, 112.0, "height");
+        assert!(item >= 112.0, "item height {item}");
+        let (size, _) = measure(
+            ROW,
+            "",
+            around(E("span", "display:inline-block;width:300px", vec![T("QR")])),
+        );
+        assert_eq!(size.0, 300.0, "width");
+    }
+
+    #[test]
+    fn min_height_counts_with_and_without_text() {
+        for (i, kids) in [vec![], vec![T("QR")]].into_iter().enumerate() {
+            let (size, item) = measure(
+                ROW,
+                "",
+                around(E("span", "display:inline-block;min-height:120px", kids)),
+            );
+            assert!(
+                size.1 >= 120.0,
+                "box height {} (kids variant {i}: 0 empty, 1 text)",
+                size.1
+            );
+            assert!(item >= 120.0, "item height {item} (kids variant {i})");
+        }
+    }
+
+    #[test]
+    fn an_inline_flex_box_keeps_its_height() {
+        let (size, item) = measure(
+            ROW,
+            "",
+            around(E("span", "display:inline-flex;height:112px", vec![T("QR")])),
+        );
+        assert_eq!(size.1, 112.0, "height");
+        assert!(item >= 112.0, "item height {item}");
+    }
+
+    #[test]
+    fn the_item_itself_is_still_sized_by_flex() {
+        // The fix is on the boxes inside the item: the item keeps `ContentSize`, so the main size flex gives it (here
+        // the shrunk 200 px, not its 300 px basis) is not overridden by its own `flex-basis`.
+        let (doc, ids) = laid_out(
+            "display:flex;width:200px",
+            "flex:0 1 300px",
+            vec![
+                T("a"),
+                E(
+                    "span",
+                    "display:inline-block;width:50px;height:50px",
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(doc.nodes[ids["div"]].final_layout.size.width, 200.0);
+        assert_eq!(doc.nodes[ids["span"]].final_layout.size.width, 50.0);
+    }
+
+    #[test]
+    fn an_absolute_box_is_unchanged() {
+        let (size, _) = measure(
+            "display:flex;position:relative",
+            "",
+            around(E(
+                "span",
+                "display:inline-block;position:absolute;width:50px;height:60px",
+                vec![],
+            )),
+        );
+        assert_eq!(size, (50.0, 60.0));
+    }
+}
