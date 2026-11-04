@@ -85,19 +85,11 @@ impl BaseDocument {
                     return Size::ZERO;
                 }
 
-                // Compute size of inline boxes. `inputs.sizing_mode` is the mode of THIS node, the inline root:
-                // Taffy's flexbox lays out each of its items in `ContentSize` ("the caller has already applied this
-                // node's own `size`, ignore it"), and `compute_leaf_layout` then also ignores `min_size` / `max_size`.
-                // That is a statement about the item, not about the atomic inlines in its lines: each of those is a
-                // box in its own right and uses its specified `width` / `height` / `min-*` / `max-*` (CSS 2.1 §10.3.9,
-                // §10.6.6, §10.4, §10.7). Taffy's block, grid and table code reset the mode for every child the same
-                // way; handing the item's mode on measured a fixed-size `inline-block` in a flex item at its content
-                // size (a 112 px QR box was 0 or one line tall) and the next block overlapped it (html-to-pdf F217).
+                // Compute size of inline boxes
                 let child_inputs = taffy::tree::LayoutInput {
                     known_dimensions: Size::NONE,
                     available_space,
                     parent_size: available_space.into_options(),
-                    sizing_mode: taffy::SizingMode::InherentSize,
                     ..inputs
                 };
                 for ibox in inline_layout.layout.inline_boxes_mut() {
