@@ -283,6 +283,8 @@ pub(crate) fn replay(ops: Vec<InlineOp<'_>>, builder: &mut TreeBuilder<'_, TextB
                 width: 0.0,
                 height: 0.0,
                 baseline_aligned,
+                // The alignment baseline of an atomic inline is not reported yet: bottom-on-baseline, as before.
+                baseline: None,
             }),
             // Nothing for Parley: the box has no text. `line_content_after_last_break` has read it.
             InlineOp::BoxStart { .. } | InlineOp::EndEdge => {}
