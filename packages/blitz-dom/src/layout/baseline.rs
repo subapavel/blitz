@@ -5,6 +5,9 @@
 //! bottom margin edge is the baseline. `overflow: clip` does not make a scroll container (css-overflow-3 §3.1) and Chrome
 //! gives such a box the baseline of its last line like `visible` (measured, m153).
 //!
+//! css-align-3 §9.1 (`baseline-source: auto`): the last baseline for an `inline-block`, the first for every other box. So an
+//! `inline-flex` and an `inline-grid` use the baseline of their first item and an `inline-table` that of its first row.
+//!
 //! Parley places an inline box by `InlineBox::baseline`, a distance from the top of its margin box. This module computes that
 //! distance from the layout of the box's subtree, so the subtree must have been laid out (`RunMode::PerformLayout`) before.
 
@@ -25,6 +28,8 @@ pub(crate) fn atomic_inline_baseline(
     node_id: usize,
     parent_width: Option<f32>,
 ) -> Option<f32> {
+    use style::values::specified::box_::DisplayInside;
+
     let node = &doc.nodes[node_id];
     if makes_scroll_container(&node.style) {
         return None;
@@ -37,7 +42,35 @@ pub(crate) fn atomic_inline_baseline(
         .style
         .border
         .resolve_or_zero(parent_width, resolve_calc_value);
-    last_line_baseline(doc, node_id, border.top + padding.top, 0)
+    let top_inset = border.top + padding.top;
+    match node.display_style().map(|d| d.inside()) {
+        Some(DisplayInside::Flex | DisplayInside::Grid) => {
+            first_item_baseline(doc, node_id, top_inset)
+        }
+        Some(DisplayInside::Table) => first_line_baseline(doc, node_id, top_inset, 0),
+        _ => last_line_baseline(doc, node_id, top_inset, 0),
+    }
+}
+
+/// The baseline of a flex or grid container: that of its first in-flow item (css-flexbox-1 §8.5, css-grid-1 §9.1; no item takes
+/// part in baseline alignment here, Blitz gives Taffy no item baselines). An item with no line of its own gives its bottom border
+/// edge (the baseline is synthesized from the border box). No in-flow item: none.
+fn first_item_baseline(doc: &BaseDocument, node_id: usize, top_inset: f32) -> Option<f32> {
+    let node = &doc.nodes[node_id];
+    // An inline root holding the items' text directly has no items: its first line it is.
+    if node
+        .element_data()
+        .is_some_and(|el| el.inline_layout_data.is_some())
+    {
+        return first_line_baseline(doc, node_id, top_inset, 0);
+    }
+    let layout_children = node.layout_children.borrow();
+    let children: &[usize] = layout_children.as_deref().unwrap_or(&node.children);
+    let item = *children.iter().find(|&&c| !out_of_flow(doc, c))?;
+    let layout = &doc.nodes[item].unrounded_layout;
+    let inset = layout.border.top + layout.padding.top;
+    let inner = first_line_baseline(doc, item, inset, 1).unwrap_or(layout.size.height);
+    Some(layout.location.y + inner)
 }
 
 /// Whether the box lays its content out in a box that clips and scrolls it, which sets its baseline to the bottom edge.
@@ -70,35 +103,78 @@ pub(crate) fn last_line_baseline(
     top_inset: f32,
     depth: usize,
 ) -> Option<f32> {
+    line_baseline(doc, node_id, top_inset, depth, false)
+}
+
+/// The same for the first line box in the normal flow, with the first in-flow child instead of the last. A table cell on the way
+/// whose `vertical-align` is not `baseline` has no baseline of its text: its bottom edge stands in for it (Chrome, measured: a
+/// real `<table>` with the default middle cells has its baseline on the bottom of the first cell).
+pub(crate) fn first_line_baseline(
+    doc: &BaseDocument,
+    node_id: usize,
+    top_inset: f32,
+    depth: usize,
+) -> Option<f32> {
+    line_baseline(doc, node_id, top_inset, depth, true)
+}
+
+fn line_baseline(
+    doc: &BaseDocument,
+    node_id: usize,
+    top_inset: f32,
+    depth: usize,
+    first: bool,
+) -> Option<f32> {
+    use style::values::generics::box_::{VerticalAlign, VerticalAlignKeyword};
+    use style::values::specified::box_::DisplayInside;
+
     if depth >= MAX_DEPTH {
         return None;
     }
     let node = &doc.nodes[node_id];
-    // An inline root: the baseline of its last line. Parley's `baseline` is measured from the top of the layout.
+    // A table cell that is not baseline-aligned: its bottom edge, in the coordinates of the cell itself.
+    if first
+        && node
+            .display_style()
+            .is_some_and(|d| d.inside() == DisplayInside::TableCell)
+        && !node.primary_styles().is_some_and(|s| {
+            matches!(
+                s.clone_vertical_align(),
+                VerticalAlign::Keyword(VerticalAlignKeyword::Baseline)
+            )
+        })
+    {
+        return Some(node.unrounded_layout.size.height);
+    }
+    // An inline root: the baseline of its first or last line. Parley's `baseline` is measured from the top of the layout.
     if let Some(text) = node
         .element_data()
         .and_then(|el| el.inline_layout_data.as_ref())
     {
-        if let Some(line) = text.layout.lines().last() {
+        let mut lines = text.layout.lines();
+        let line = if first { lines.next() } else { lines.last() };
+        if let Some(line) = line {
             return Some(top_inset + line.metrics().baseline / doc.viewport.scale());
         }
     }
     // Blitz's `layout_children` is authoritative about what is in flow: an explicit empty list means none.
     let layout_children = node.layout_children.borrow();
     let children: &[usize] = layout_children.as_deref().unwrap_or(&node.children);
-    for &child_id in children.iter().rev() {
+    let walk = |child_id: usize| {
         if out_of_flow(doc, child_id) {
-            continue;
+            return None;
         }
         // Only the box that is itself the atomic inline loses its baseline to `overflow` (CSS 2.1 §10.8.1); a nested block
         // keeps the baseline of its lines, as it did when fulgur walked the tree.
         let layout = &doc.nodes[child_id].unrounded_layout;
         let inset = layout.border.top + layout.padding.top;
-        if let Some(inner) = last_line_baseline(doc, child_id, inset, depth + 1) {
-            return Some(layout.location.y + inner);
-        }
+        line_baseline(doc, child_id, inset, depth + 1, first).map(|inner| layout.location.y + inner)
+    };
+    if first {
+        children.iter().find_map(|&c| walk(c))
+    } else {
+        children.iter().rev().find_map(|&c| walk(c))
     }
-    None
 }
 
 #[cfg(test)]
@@ -449,5 +525,92 @@ mod tests {
         );
         assert_ne!(truth, wide, "the probe must wrap differently");
         assert_eq!(measured.size.height, truth, "measured at 30px");
+    }
+
+    /// A real `<table style="display:inline-table">`: with the default (middle) cells its baseline is the bottom of the first cell,
+    /// with a `vertical-align: baseline` cell the baseline of the text in it (Chrome m153, measured).
+    #[test]
+    fn a_real_inline_table_has_the_bottom_of_its_first_middle_cell_as_baseline() {
+        let table = |cell: &'static str| {
+            laid_out(vec![E(
+                "p#p",
+                "margin:0",
+                vec![
+                    T("ab "),
+                    E(
+                        "table#box",
+                        "display:inline-table;border-spacing:0;border:3px solid #000",
+                        vec![E(
+                            "tbody",
+                            "",
+                            vec![
+                                E("tr", "", vec![E("td#c1", cell, vec![T("x")])]),
+                                E("tr", "", vec![E("td#c2", "padding:0", vec![T("y")])]),
+                            ],
+                        )],
+                    ),
+                    T(" cd"),
+                ],
+            )])
+        };
+        // Border 3 + the 40px cell.
+        let (doc, ids) = table("padding:0;height:40px");
+        assert_eq!(baseline_of(&doc, ids["box"]), Some(43.0));
+        let (doc, ids) = table("padding:0");
+        assert_eq!(baseline_of(&doc, ids["box"]), Some(23.0));
+        // A baseline cell: the text of the first cell (20px line, the baseline below its top).
+        let (doc, ids) = table("padding:0;height:40px;vertical-align:baseline");
+        let b = baseline_of(&doc, ids["box"]).unwrap();
+        assert!(b > 3.0 && b < 3.0 + 20.0, "{b}");
+        // The box is seated by it.
+        let p = &doc.nodes[ids["p"]];
+        let text = p
+            .element_data()
+            .unwrap()
+            .inline_layout_data
+            .as_ref()
+            .unwrap();
+        let line = text.layout.lines().next().unwrap();
+        let top = doc.nodes[ids["box"]].unrounded_layout.location.y;
+        assert!((top + b - line.metrics().baseline / doc.viewport.scale()).abs() < 0.01);
+    }
+
+    /// The first item of an inline-flex or inline-grid gives the baseline, not the last.
+    #[test]
+    fn a_flex_or_grid_container_takes_the_baseline_of_its_first_item() {
+        for display in [
+            "inline-flex;align-items:flex-start",
+            "inline-flex;flex-direction:column",
+            "inline-grid",
+        ] {
+            let style: &'static str =
+                Box::leak(format!("display:{display};width:100px").into_boxed_str());
+            let (doc, ids) = laid_out(vec![ib(
+                style,
+                vec![
+                    E("div#a", "height:40px", vec![T("a")]),
+                    E("div#b", "height:20px", vec![T("b")]),
+                ],
+            )]);
+            let a = &doc.nodes[ids["a"]].unrounded_layout;
+            let got = baseline_of(&doc, ids["box"]).unwrap();
+            // The first item's text line: 20px line, so within its first 20px.
+            assert!(
+                got >= a.location.y && got <= a.location.y + 20.0,
+                "{display}: {got}"
+            );
+        }
+    }
+
+    /// An item with no line gives its bottom border edge.
+    #[test]
+    fn a_first_item_with_no_line_gives_its_bottom_edge() {
+        let (doc, ids) = laid_out(vec![ib(
+            "display:inline-flex;width:100px",
+            vec![E("div#a", "height:30px;width:10px", vec![])],
+        )]);
+        assert_eq!(baseline_of(&doc, ids["box"]), Some(30.0));
+        let (doc, ids) = laid_out(vec![ib("display:inline-flex;width:100px", vec![])]);
+        assert_eq!(baseline_of(&doc, ids["box"]), None);
     }
 }
