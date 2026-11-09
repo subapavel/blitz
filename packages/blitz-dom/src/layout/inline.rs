@@ -334,6 +334,8 @@ impl BaseDocument {
                                     (ibox.y / scale) + margin.top + container_pb.top;
                                 layout.padding = padding; //.map(|p| p / scale);
                                 layout.border = border; //.map(|p| p / scale);
+                                // Parley placed the margin box; the painter needs the offset of the border box in it.
+                                layout.margin = margin;
                             }
                         }
                     }
