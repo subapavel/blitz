@@ -4,6 +4,7 @@ use taffy::{
     ResolveOrZero as _, Size, compute_leaf_layout,
 };
 
+use super::baseline;
 use super::resolve_calc_value;
 use crate::BaseDocument;
 
@@ -101,10 +102,35 @@ impl BaseDocument {
                     if style.position == Position::Absolute {
                         ibox.width = 0.0;
                         ibox.height = 0.0;
+                        ibox.baseline = None;
                     } else {
-                        let output = self.compute_child_layout(NodeId::from(ibox.id), child_inputs);
+                        // A box with content is laid out in full also when the root is only measured: its baseline
+                        // is read from the lines of its subtree, which a measuring pass would not leave behind
+                        // (and the measured height would then differ from the laid-out one). Taffy's block layout
+                        // does the same for its in-flow children (`compute/block.rs`).
+                        let has_content = self.nodes[ibox.id as usize].flags.is_inline_root()
+                            || self.nodes[ibox.id as usize]
+                                .layout_children
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|c| !c.is_empty());
+                        let box_inputs = if has_content {
+                            taffy::tree::LayoutInput {
+                                run_mode: taffy::RunMode::PerformLayout,
+                                ..child_inputs
+                            }
+                        } else {
+                            child_inputs
+                        };
+                        let output = self.compute_child_layout(NodeId::from(ibox.id), box_inputs);
                         ibox.width = (margin.left + margin.right + output.size.width) * scale;
                         ibox.height = (margin.top + margin.bottom + output.size.height) * scale;
+                        ibox.baseline = baseline::atomic_inline_baseline(
+                            self,
+                            ibox.id as usize,
+                            child_inputs.parent_size.width,
+                        )
+                        .map(|b| (margin.top + b) * scale);
                     }
                 }
 
